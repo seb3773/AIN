@@ -1,6 +1,6 @@
 # ain — Transas AIN 2.32 Archiver (Native C Reimplementation)
 
-Pure C reimplementation by **seb3773** (https://github.com/seb3773/AIN) of the historical **Transas AIN 2.32 archiver** (1993–1996, Transas Marine Ltd.).
+Pure C reimplementation of the historical **Transas AIN 2.32 archiver** (1993–1996, Transas Marine Ltd.).
 
 > **Reverse Engineering & Legal Notice:** This work was conducted strictly for the purposes of software interoperability and digital data preservation (under European Directive 2009/24/EC) to reconstruct the prediction, compression, and decompression algorithms of an obsolete historical archive format.
 
