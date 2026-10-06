@@ -372,4 +372,4 @@ Achieving 100% bit-exact parity on Mode M2 required solving a subtle artifact of
 ## License
 
 Historical format and original DOS binary copyright (c) 1993–1996 Transas Marine Ltd.  
-Clean-room reverse-engineered C reimplementation created for interoperability and digital preservation.
+Pure C reimplementation reverse-engineered from the historical DOS binary for software interoperability and digital data preservation (EU Directive 2009/24/EC).
