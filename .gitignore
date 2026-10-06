@@ -1,0 +1,9 @@
+# Build artifacts & packages
+build/
+*.deb
+*.o
+.tmp_*
+
+# Work & scratch directories
+_work/
+.backup/
