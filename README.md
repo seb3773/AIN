@@ -300,9 +300,9 @@ The original compressor binary was distributed as an AIN2 self-extracting archiv
    - Pausing DOSBox while `AIN.EXE` displayed its shareware screen (*"Press Enter to continue"*).
      *(Ironic historical twist: the ubiquitous shareware nag screen that annoyed so many users in the 1990s—hardly anyone had registered copies back then—turned out to be the golden ticket for reverse engineering! Because the SFX stub had fully decompressed the payload into memory before halting to display the prompt, the raw binary sat frozen and intact in RAM, waiting to be dumped.)*
    - Scanning the DOSBox emulated 1 MB conventional memory block.
-   - Extracting the decompressed binary and reconstructing a clean MZ executable header ([`dump_dosbox_sfx.py`](_work/traces/dump_dosbox_sfx.py)).
+   - Extracting the decompressed binary and reconstructing a clean MZ executable header (`dump_dosbox_sfx.py`).
 3. **Disassembly & Reconstruction**:
-   - Disassembling the resulting 78,640-byte binary ([`AIN_UNP.EXE`](AIN_UNP.EXE)) with `ndisasm` into [`ain_unpacked_disasm.txt`](_work/docs/ain_unpacked_disasm.txt).
+   - Disassembling the resulting 78,640-byte binary ([`historical_dos/AIN_UNP.EXE`](historical_dos/AIN_UNP.EXE)) with `ndisasm` into `ain_unpacked_disasm.txt`.
    - Mapping out the compressor's data structures, hash functions, and block boundary heuristics.
 
 ---
@@ -354,7 +354,7 @@ Achieving 100% bit-exact parity on Mode M2 required solving a subtle artifact of
 
 ## File Structure
 
-- [`build/ain`](build/ain) — Compiled unified native binary (compressor + decompressor + SFX + multi-volumes).
+- `build/ain` — Compiled unified native binary (generated via `make` or `./build.sh`).
 - [`src/ain.c`](src/ain.c) — Unified native C archiver source.
 - [`src/ain_sfx_linux_stub.c`](src/ain_sfx_linux_stub.c) — Standalone Linux ELF x86_64 SFX extractor stub source.
 - [`src/ain_sfx_linux_stub.h`](src/ain_sfx_linux_stub.h) — Embedded Linux ELF SFX extraction stub (AIN M1 compressed).
@@ -366,7 +366,6 @@ Achieving 100% bit-exact parity on Mode M2 required solving a subtle artifact of
 - [`Makefile`](Makefile) — Build configuration (zero external dependencies).
 - [`corpus/`](corpus/) — Uncompressed test files.
 - [`packed_corpus/`](packed_corpus/) — Reference archives packed with historical DOS AIN.
-- [`_work/`](_work/) — Reverse-engineering research materials, disassembly, dynamic traces, and experimental scripts.
 
 ---
 
