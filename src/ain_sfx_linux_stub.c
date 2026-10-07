@@ -712,7 +712,7 @@ int main(int argc, char *argv[])
     uint32_t arc_ts  = rd32(data + 10);
     uint32_t idx_pos = rd32(data + 14);
     int is_stored = ((method & 0x0Fu) == 4u);
-    int is_multi = ((data[3] & 0x40u) != 0);
+    int is_multi = ((data[3] & 0x40u) != 0) && (idx_pos == 0 || idx_pos >= arc_size);
 
     GrowBuf idx_buf = {0};
     GrowBuf combined_stream = {0};

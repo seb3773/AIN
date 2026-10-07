@@ -3311,7 +3311,10 @@ static int load_archive_set(const char *arcpath, ArchiveSet *set)
     set->vols[0].idx_pos = idx_pos0;
     set->n_vols = 1;
 
-    int is_multi = (flags0 & 0x40u) != 0;
+    /* AIN 2.32 multi-volume slices have flags & 0x40 and idx_pos == 0 on intermediate volumes.
+     * Earlier AIN versions (2.2 / 2.22 /F fragments) also set flags & 0x40, but write a
+     * self-contained index (idx_pos != 0) on each volume, treated as a standalone volume archive. */
+    int is_multi = ((flags0 & 0x40u) != 0) && (idx_pos0 == 0 || idx_pos0 >= arc_sz0);
 
     GrowBuf stream_buf = {0};
 

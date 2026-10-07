@@ -32,11 +32,14 @@ update-dos-stub: historical_dos/AINEXT.EXE $(TARGET)
 	rm -f .tmp_dos_stub.ain
 
 test: $(TARGET)
-	@echo "Running tests against reference corpus..."
+	@echo "Running tests against reference corpus (AIN 2.32)..."
 	./$(TARGET) l packed_corpus/CORPACK.AIN
 	./$(TARGET) t packed_corpus/CORPACK.AIN
 	./$(TARGET) l packed_corpus/NESTED.AIN
 	./$(TARGET) t packed_corpus/NESTED.AIN
+	@echo "Running backward compatibility tests (AIN 2.22 & 2.2)..."
+	./tests/verify_ain222.sh
+	./tests/verify_ain22.sh
 	@echo "All tests passed successfully."
 
 install: $(TARGET)

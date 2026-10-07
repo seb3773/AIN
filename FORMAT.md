@@ -48,7 +48,7 @@ Every AIN archive (and multi-volume fragment) begins with a mandatory 24-byte bi
 | `0x06..0x07` | 2 | `uint16 LE` | `vol_idx` | Volume sequence index (`0` for base volume, `1` for `.A01`, `2` for `.A02`, ...) |
 | `0x08..0x09` | 2 | `uint16 LE` | `n_files` | Total number of files archived in the set |
 | `0x0A..0x0D` | 4 | `uint32 LE` | `timestamp` | Archive creation timestamp (Standard DOS bit-packed datetime) |
-| `0x0E..0x11` | 4 | `uint32 LE` | `idx_pos` | Byte offset where the compressed index stream starts (`0` in intermediate split volumes) |
+| `0x0E..0x11` | 4 | `uint32 LE` | `idx_pos` | Byte offset where the compressed index stream starts (`0` in intermediate split volumes in 2.32; non-zero local index per volume in 2.2/2.22) |
 | `0x12..0x13` | 2 | `uint16 LE` | `idx_crc` | Arithmetic sum of all compressed index bytes: `sum(idx_bytes) & 0xFFFF` |
 | `0x14..0x15` | 2 | `uint16 LE` | `reserved3` | Reserved (`0x0000`) |
 | `0x16..0x17` | 2 | `uint16 LE` | `hdr_crc` | Header checksum: `(sum(hdr[0..21]) & 0xFFFF) ^ 0x5555` |
