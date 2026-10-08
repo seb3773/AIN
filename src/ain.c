@@ -39,9 +39,17 @@
 #include <errno.h>
 #include <strings.h>
 #include <limits.h>
-#include <fnmatch.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <fcntl.h>
+#define ain_mkdir(p) _mkdir(p)
+#else
+#define ain_mkdir(p) mkdir(p, 0755)
+#endif
 #include "ain_sfx_stub.h"
 #include "ain_sfx_linux_stub.h"
+#include "ain_sfx_win_stub.h"
 
 #define AIN_VERSION_STR    "2.32"
 #define MAGIC_AIN          0x21u
@@ -84,6 +92,29 @@ static int is_safe_relpath(const char *path)
     return 1;
 }
 
+/* Portable wildcard matcher (* and ?), case-insensitive */
+static int wildcard_match(const char *pat, const char *str)
+{
+    while (*pat) {
+        if (*pat == '*') {
+            while (*pat == '*') pat++;
+            if (!*pat) return 1;
+            while (*str) {
+                if (wildcard_match(pat, str)) return 1;
+                str++;
+            }
+            return 0;
+        } else if (*pat == '?' || tolower((unsigned char)*pat) == tolower((unsigned char)*str)) {
+            if (!*str) return 0;
+            pat++;
+            str++;
+        } else {
+            return 0;
+        }
+    }
+    return *str == '\0';
+}
+
 static int match_pattern(const char *pattern, const char *path, const char *filename)
 {
     if (!pattern || !pattern[0]) return 1;
@@ -117,8 +148,8 @@ static int match_pattern(const char *pattern, const char *path, const char *file
     }
     fname_norm[flen] = '\0';
 
-    if (fnmatch(pat_norm, path_norm, 0) == 0) return 1;
-    if (fnmatch(pat_norm, fname_norm, 0) == 0) return 1;
+    if (wildcard_match(pat_norm, path_norm)) return 1;
+    if (wildcard_match(pat_norm, fname_norm)) return 1;
     if (strcmp(pat_norm, path_norm) == 0) return 1;
     if (strcmp(pat_norm, fname_norm) == 0) return 1;
 
@@ -2581,13 +2612,14 @@ static void mkdirs(const char *path)
     char tmp[600];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
+        if (*p == '/' || *p == '\\') {
+            char sep = *p;
             *p = '\0';
-            mkdir(tmp, 0755);
-            *p = '/';
+            ain_mkdir(tmp);
+            *p = sep;
         }
     }
-    mkdir(tmp, 0755);
+    ain_mkdir(tmp);
 }
 
 static int parse_index(const uint8_t *idx, size_t idx_len, int n_files,
@@ -2747,6 +2779,44 @@ static int ain_locate_archive(const uint8_t *data, size_t file_size, size_t *out
         return 0;
     }
     if (file_size >= 64 && data[0] == 'M' && data[1] == 'Z') {
+        /* Check Windows PE signature */
+        if (file_size >= 0x40) {
+            uint32_t pe_off = (uint32_t)(data[0x3C] | (data[0x3D]<<8) | (data[0x3E]<<16) | (data[0x3F]<<24));
+            if (pe_off + 24 <= file_size && data[pe_off] == 'P' && data[pe_off+1] == 'E' && data[pe_off+2] == 0 && data[pe_off+3] == 0) {
+                uint16_t n_secs = (uint16_t)(data[pe_off+6] | (data[pe_off+7] << 8));
+                uint16_t opt_sz = (uint16_t)(data[pe_off+20] | (data[pe_off+21] << 8));
+                size_t sec_table = (size_t)(pe_off + 24 + opt_sz);
+                size_t sfx_offset = 0;
+                for (uint16_t i = 0; i < n_secs; i++) {
+                    size_t spo = sec_table + (size_t)i * 40;
+                    if (spo + 40 <= file_size) {
+                        uint32_t r_sz  = (uint32_t)(data[spo+16] | (data[spo+17]<<8) | (data[spo+18]<<16) | (data[spo+19]<<24));
+                        uint32_t r_off = (uint32_t)(data[spo+20] | (data[spo+21]<<8) | (data[spo+22]<<16) | (data[spo+23]<<24));
+                        if ((size_t)(r_off + r_sz) > sfx_offset) sfx_offset = (size_t)(r_off + r_sz);
+                    }
+                }
+                if (sfx_offset + 24 <= file_size && data[sfx_offset] == MAGIC_AIN) {
+                    uint16_t hdr_crc = (uint16_t)(data[sfx_offset+22] | (data[sfx_offset+23] << 8));
+                    if (((ain_checksum(data + sfx_offset, 22) ^ 0x5555u) & 0xFFFFu) == hdr_crc) {
+                        if (out_offset) *out_offset = sfx_offset;
+                        if (is_sfx) *is_sfx = 3;
+                        return 0;
+                    }
+                }
+                /* Fallback: scan for AIN header */
+                for (size_t o = sfx_offset; o + 24 <= file_size; o++) {
+                    if (data[o] == MAGIC_AIN) {
+                        uint16_t hdr_crc = (uint16_t)(data[o+22] | (data[o+23] << 8));
+                        if (((ain_checksum(data + o, 22) ^ 0x5555u) & 0xFFFFu) == hdr_crc) {
+                            if (out_offset) *out_offset = o;
+                            if (is_sfx) *is_sfx = 3;
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+        /* Historical DOS real-mode executable */
         uint16_t cblp = (uint16_t)(data[2] | (data[3] << 8));
         uint16_t cp   = (uint16_t)(data[4] | (data[5] << 8));
         size_t sfx_offset = (cblp == 0) ? ((size_t)cp * 512) : ((size_t)(cp - 1) * 512 + cblp);
@@ -2968,6 +3038,18 @@ static int cmd_add(const char *arcname, int method, int recursive,
             }
             stub_data = custom_stub;
             stub_size = csz;
+        } else if (sfx == 3) {
+            BS bs;
+            bs_init(&bs, ain_compressed_win_sfx_stub, sizeof(ain_compressed_win_sfx_stub));
+            if (decompress_stream(&bs, &decomp_stub) < 0 || !decomp_stub.data) {
+                fprintf(stderr, "Error: failed to decompress embedded Windows SFX stub\n");
+                free(raw_idx); free(stream_data); free(idx_bw.data);
+                for (int i = 0; i < n_files; i++) free(files[i].data);
+                free(files);
+                return 1;
+            }
+            stub_data = decomp_stub.data;
+            stub_size = decomp_stub.size;
         } else if (sfx == 2) {
             BS bs;
             bs_init(&bs, ain_compressed_linux_sfx_stub, sizeof(ain_compressed_linux_sfx_stub));
@@ -3035,7 +3117,7 @@ static int cmd_add(const char *arcname, int method, int recursive,
         fwrite(stream_data, 1, stream_size, out);
         fwrite(idx_bw.data, 1, idx_bw.pos,  out);
         fclose(out);
-        if (sfx == 2) {
+        if (sfx == 2 || sfx == 3) {
             chmod(arcname, 0755);
         }
     } else {
@@ -3097,7 +3179,7 @@ static int cmd_add(const char *arcname, int method, int recursive,
             fwrite(stream_data, 1, slice0, out0);
         }
         fclose(out0);
-        if (sfx == 2) chmod(arcname, 0755);
+        if (sfx == 2 || sfx == 3) chmod(arcname, 0755);
         printf("Creating fragment %s (volume 0)\n", arcname);
 
         size_t stream_offset = slice0;
@@ -3490,8 +3572,9 @@ static int cmd_list(const char *arcname, int verbose, int unix_paths, int bare_l
         printf("Archive: %s (%d volumes/fragments)\n", arcname, set.n_vols);
     } else {
         printf("Archive: %s%s\n", arcname,
-               set.is_sfx == 2 ? " (Linux SFX Executable)" :
-               (set.is_sfx == 1 ? " (DOS SFX Executable)" : ""));
+               set.is_sfx == 3 ? " (Windows SFX Executable)" :
+               (set.is_sfx == 2 ? " (Linux SFX Executable)" :
+               (set.is_sfx == 1 ? " (DOS SFX Executable)" : "")));
     }
     printf("Method : %s, Files: %u, Created: %s\n\n", mstr, set.n_files, date_str);
 
@@ -3606,6 +3689,9 @@ static int cmd_extract_or_test(const char *arcname, const char *outdir,
     }
 
     if (do_pipe) {
+#ifdef _WIN32
+        _setmode(_fileno(stdout), _O_BINARY);
+#endif
         fwrite(stream_out.data, 1, stream_out.size, stdout);
         free(stream_out.data);
         free_archive_set(&set);
@@ -3808,6 +3894,7 @@ static void show_usage(const char *prog)
     printf("  -m3    Fast compression\n");
     printf("  -m4    Store (no compression)\n");
     printf("  -sl[stub], --sfx-linux  Create Linux native self-extracting archive (.sfx)\n");
+    printf("  -sw[stub], --sfx-win    Create Windows native self-extracting archive (.exe)\n");
     printf("  -s[stub], -sdos         Create DOS self-extracting archive (.exe)\n");
     printf("  -f<size> Multi-volume / fragment size (-f1.44, -f720, -f1200, -f360, -f<N>k, -f<N>m)\n");
     printf("  -r     Recurse into subdirectories\n");
@@ -3821,6 +3908,7 @@ static void show_usage(const char *prog)
     printf("  %s a archive.ain file1.txt file2.bin\n", prog);
     printf("  %s a -f1.44 floppy.ain file1.txt file2.bin\n", prog);
     printf("  %s a -sl setup.sfx file1.txt file2.bin\n", prog);
+    printf("  %s a -sw setup.exe file1.txt file2.bin\n", prog);
     printf("  %s a -s setup.exe file1.txt file2.bin\n", prog);
     printf("  %s a -m1 -r archive.ain myfolder/\n", prog);
     printf("  %s x archive.ain -o extracted/\n", prog);
@@ -3906,12 +3994,34 @@ int main(int argc, char *argv[])
                 bare_list = 1;
                 continue;
             }
-            if (strcmp(arg, "--sfx-linux") == 0 || strcmp(arg, "--sfx") == 0) {
+            if (strcmp(arg, "--sfx-win") == 0 || strcmp(arg, "--sfx-windows") == 0) {
+                sfx_mode = 3;
+                continue;
+            }
+            if (strcmp(arg, "--sfx-linux") == 0) {
                 sfx_mode = 2;
+                continue;
+            }
+            if (strcmp(arg, "--sfx") == 0) {
+#ifdef _WIN32
+                sfx_mode = 3;
+#else
+                sfx_mode = 2;
+#endif
                 continue;
             }
             if (strcmp(arg, "--sfx-dos") == 0) {
                 sfx_mode = 1;
+                continue;
+            }
+            if (strncasecmp(arg, "-swin", 5) == 0) {
+                sfx_mode = 3;
+                if (arg[5] != '\0') sfx_stub_path = arg + 5;
+                continue;
+            }
+            if (strncasecmp(arg, "-sw", 3) == 0) {
+                sfx_mode = 3;
+                if (arg[3] != '\0') sfx_stub_path = arg + 3;
                 continue;
             }
             if (strncasecmp(arg, "-slinux", 7) == 0) {
@@ -3931,7 +4041,11 @@ int main(int argc, char *argv[])
             }
             char flag = (char)tolower((unsigned char)arg[1]);
             if (flag == 's') {
+#ifdef _WIN32
+                sfx_mode = 3;
+#else
                 sfx_mode = 1;
+#endif
                 if (arg[2] != '\0') {
                     sfx_stub_path = arg + 2;
                 }
@@ -3990,10 +4104,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (has_sfx_extension(arcname)) {
-        sfx_mode = 2;
-    } else if (has_exe_extension(arcname)) {
-        sfx_mode = 1;
+    if (sfx_mode == 0) {
+        if (has_sfx_extension(arcname)) {
+            sfx_mode = 2;
+        } else if (has_exe_extension(arcname)) {
+#ifdef _WIN32
+            sfx_mode = 3;
+#else
+            sfx_mode = 1;
+#endif
+        }
     }
 
     char arcpath[600];
@@ -4001,7 +4121,7 @@ int main(int argc, char *argv[])
     if (!strrchr(arcpath, '.')) {
         if (cmd == 'a') {
             snprintf(arcpath, sizeof(arcpath), "%s%s", arcname,
-                     sfx_mode == 2 ? ".sfx" : (sfx_mode == 1 ? ".EXE" : ".AIN"));
+                     sfx_mode == 2 ? ".sfx" : ((sfx_mode == 1 || sfx_mode == 3) ? ".EXE" : ".AIN"));
         } else {
             char try_ain[600];
             char try_sfx[600];

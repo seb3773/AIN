@@ -31,7 +31,9 @@ This project is a complete, standalone, freestanding C tool combining both **com
 Using the build script:
 
 ```sh
-./build.sh            # Production release build -> build/ain
+./build.sh            # Production Linux build -> build/linux/ain (and symlink build/ain)
+./build.sh win64      # Production Windows 64-bit build -> build/win64/ain.exe (static)
+./build.sh all        # Build both Linux and Windows 64-bit binaries
 ./build.sh debug      # Debug build with symbols
 ./build.sh test       # Run test suite against reference archives
 ./build.sh deb        # Build standalone Debian .deb package
@@ -40,7 +42,9 @@ Using the build script:
 Or using `make`:
 
 ```sh
-make                  # Compile production binary into build/ain
+make                  # Compile Linux binary into build/linux/ain
+make win64            # Cross-compile Windows 64-bit static binary into build/win64/ain.exe
+make all-platforms    # Compile both Linux and Windows binaries
 make test             # Run test suite
 make deb              # Build Debian package
 sudo make install     # Install binary to /usr/local/bin
@@ -49,8 +53,13 @@ sudo make install     # Install binary to /usr/local/bin
 Or manually:
 
 ```sh
-mkdir -p build
-gcc -O2 -Wall -Wextra -Isrc -o build/ain src/ain.c
+# Linux
+mkdir -p build/linux
+gcc -O2 -Wall -Wextra -Isrc -o build/linux/ain src/ain.c
+
+# Windows 64-bit (via MinGW-w64)
+mkdir -p build/win64
+x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -Isrc -static -o build/win64/ain.exe src/ain.c
 ```
 
 ---
@@ -82,6 +91,7 @@ ain <command> [options] <archive[.ain]> [files / dirs / patterns...]
 | `-m3` | Fast compression |
 | `-m4` | Store (no compression) |
 | `-f<size>`, `--volume=<size>` | Create **multi-volume archives** / fragments (`.ain`, `.a01`, `.a02`...) of specified size (e.g. `1.44`, `720`, `50k`, `10m`) |
+| `-sw[stub]`, `--sfx-win` | Create **Windows native self-extracting archive** (`.exe`, 64-bit PE) |
 | `-sl[stub]`, `--sfx-linux` | Create **Linux native self-extracting archive** (`.sfx`, 64-bit ELF, chmod 0755) |
 | `-s[stub]`, `-sdos` | Create **DOS self-extracting archive** (`.exe`) using embedded DOS stub (`AINEXT.EXE`) |
 | `-r` | Recurse into subdirectories (for `a`) |
@@ -98,6 +108,14 @@ ain <command> [options] <archive[.ain]> [files / dirs / patterns...]
 # Create an archive with maximum compression (M1)
 ./build/ain a archive.ain file1.txt file2.bin
 
+# Create a modern Windows self-extracting archive (.exe, 64-bit PE standalone)
+./build/ain a -sw setup.exe file1.txt file2.bin
+
+# Run the Windows SFX executable directly on Windows (or via Wine):
+setup.exe -l                     # List contents
+setup.exe -t                     # Verify integrity (CRC16)
+setup.exe -o destination\        # Extract to destination directory
+
 # Create a modern Linux self-extracting archive (.sfx, executable out-of-the-box)
 ./build/ain a -sl setup.sfx file1.txt file2.bin
 # or simply by file extension:
@@ -109,13 +127,14 @@ ain <command> [options] <archive[.ain]> [files / dirs / patterns...]
 ./setup.sfx -o destination/      # Extract to destination directory
 
 # Create a historical DOS self-extracting archive (.exe, runnable under DOS / DOSBox)
-./build/ain a -s setup.exe file1.txt file2.bin
+./build/ain a -sdos setup.exe file1.txt file2.bin
 
 # Create a multi-volume archive (floppy disk split or custom sizes)
 ./build/ain a -f1.44 backup.ain myfolder/       # 1.44 MB floppy disk fragments (.ain, .a01, .a02...)
 ./build/ain a -f50k backup.ain myfolder/        # 50 KB fragments
 
-# Multi-volume with Linux SFX (.sfx + .a01, .a02...) or DOS SFX (.exe + .a01, .a02...)
+# Multi-volume with Windows SFX (.exe + .a01...), Linux SFX (.sfx + .a01...) or DOS SFX (.exe + .a01...)
+./build/ain a -sw -f100k setup.exe myfolder/
 ./build/ain a -sl -f100k setup.sfx myfolder/
 ./build/ain a -s -f1.44 setup.exe myfolder/
 
@@ -182,28 +201,36 @@ ain <command> [options] <archive[.ain]> [files / dirs / patterns...]
 
 ### Self-Extracting Archives (SFX) & Multi-Volume Architecture
 
-`ain` supports dual SFX generation, multi-volume archives, and hardened extraction with **zero external dependencies** and **zero temporary files**:
+`ain` supports triple SFX generation (Windows 64-bit PE, Linux 64-bit ELF, DOS 16-bit), multi-volume archives, and hardened extraction with **zero external dependencies** and **zero temporary files**:
 
-1. **Linux Native SFX (`.sfx`)**:
+1. **Windows Native SFX (`.exe`, 64-bit PE)**:
+   - Prepends a freestanding 64-bit PE extractor stub ([`ain_sfx_win_stub.c`](src/ain_sfx_win_stub.c)) that inspects `GetModuleFileNameA()` to read its own binary and parses the PE section table (`SizeOfRawData` + `PointerToRawData`) to locate the appended AIN payload.
+   - Completely standalone, CLI-only: links statically with standard `msvcrt` and `kernel32` (zero external DLL requirements).
+   - Runs natively on Windows x86_64 systems (Windows 7/8/10/11, Windows Server) and under Wine (`archive.exe -o dest\`, `archive.exe -l`, `archive.exe -t`).
+   - Supports **multi-volume chaining**: automatically detects and chains neighboring `.a01`, `.a02`... files in the same directory.
+   - Supports selective extraction with wildcards and strict path traversal protection.
+
+2. **Linux Native SFX (`.sfx`, 64-bit ELF)**:
    - Prepends a freestanding 64-bit ELF extractor stub ([`ain_sfx_linux_stub.c`](src/ain_sfx_linux_stub.c)) that inspects `/proc/self/exe` to locate the appended AIN payload via ELF Program Headers.
    - Automatically sets executable permissions (`chmod 0755`).
    - Runs out-of-the-box on modern Linux distributions (`./archive.sfx -o dest/`, `./archive.sfx -l`, `./archive.sfx -t`).
    - Supports **multi-volume chaining**: if the archive is split across volumes (`.sfx`, `.a01`, `.a02`...), the standalone SFX binary automatically discovers and chains neighboring `.a01`, `.a02`... files in its directory!
    - Supports selective extraction patterns and path traversal protection.
 
-2. **Historical DOS SFX (`.exe`)**:
-   - Prepends the original 16-bit real-mode DOS stub ([`AINEXT.EXE`](AINEXT.EXE), Transas Marine Ltd.).
+3. **Historical DOS SFX (`.exe`, 16-bit Real Mode)**:
+   - Prepends the original 16-bit real-mode DOS stub ([`AINEXT.EXE`](historical_dos/AINEXT.EXE), Transas Marine Ltd.).
    - Runs under DOSBox, DOSEMU, FreeDOS, or bare metal MS-DOS.
    - Fully compatible with multi-volume DOS archives (`.exe`, `.a01`, `.a02`...).
 
-3. **In-Memory Stub Compression (Clever Self-Optimization)**:
-   - Rather than storing raw executable binaries inside `ain`, both stubs are **pre-compressed with AIN Mode M1** and embedded as C byte arrays in the build pipeline (`Makefile`):
+4. **In-Memory Stub Compression (Clever Self-Optimization)**:
+   - Rather than storing raw executable binaries inside `ain`, all stubs are **pre-compressed with AIN Mode M1** and embedded as C byte arrays in the build pipeline (`Makefile`):
+     - Windows stub: **49,664 bytes** $\rightarrow$ **25,793 bytes** (48% smaller)
      - Linux stub: **18,808 bytes** $\rightarrow$ **7,846 bytes** (58% smaller)
      - DOS stub: **32,374 bytes** $\rightarrow$ **19,597 bytes** (40% smaller)
-     - Total embedded footprint: **51,182 bytes** $\rightarrow$ **27,443 bytes** (-46% space saved in the `ain` binary).
-   - When `-s` or `-sl` is invoked, `ain` inflates the required stub in RAM in under a millisecond using its internal `decompress_stream()` engine and streams it directly to the output executable. No files are ever written to `/tmp` or the working directory.
+     - Total embedded footprint: **100,846 bytes** $\rightarrow$ **53,236 bytes** (-47% space saved in the `ain` binary).
+   - When `-sw`, `-sl`, or `-s` is invoked, `ain` inflates the required stub in RAM in under a millisecond using its internal `decompress_stream()` engine and streams it directly to the output executable. No files are ever written to `/tmp` or the working directory.
 
-4. **Multi-Volume Fragment System (`.ain` / `.sfx` / `.exe` + `.a01`, `.a02`...)**:
+5. **Multi-Volume Fragment System (`.ain` / `.sfx` / `.exe` + `.a01`, `.a02`...)**:
    - Split creation via `-f<size>` supporting standard floppy formats (`360`, `720`, `1.2`, `1.44`, `2.88`), human-readable units (`50k`, `10m`, `1g`), or raw bytes.
    - Continuous solid stream is sliced across volume payloads (`24-byte header + slice`).
    - The compressed index section is appended to the final volume.
@@ -379,8 +406,11 @@ Key architectural notes:
 
 ## File Structure
 
-- `build/ain` — Compiled unified native binary (generated via `make` or `./build.sh`).
+- `build/linux/ain` — Compiled Linux ELF 64-bit binary (with convenience symlink `build/ain`).
+- `build/win64/ain.exe` — Compiled Windows PE 64-bit standalone static binary.
 - [`src/ain.c`](src/ain.c) — Unified native C archiver source.
+- [`src/ain_sfx_win_stub.c`](src/ain_sfx_win_stub.c) — Standalone Windows PE x86_64 SFX extractor stub source.
+- [`src/ain_sfx_win_stub.h`](src/ain_sfx_win_stub.h) — Embedded Windows PE SFX extraction stub (AIN M1 compressed).
 - [`src/ain_sfx_linux_stub.c`](src/ain_sfx_linux_stub.c) — Standalone Linux ELF x86_64 SFX extractor stub source.
 - [`src/ain_sfx_linux_stub.h`](src/ain_sfx_linux_stub.h) — Embedded Linux ELF SFX extraction stub (AIN M1 compressed).
 - [`src/ain_sfx_stub.h`](src/ain_sfx_stub.h) — Embedded 16-bit DOS SFX extraction stub (`AINEXT.EXE`, AIN M1 compressed).

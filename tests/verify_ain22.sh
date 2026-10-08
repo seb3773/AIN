@@ -3,7 +3,13 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-AIN="${AIN:-$ROOT/build/ain}"
+if [ -z "${AIN:-}" ]; then
+    if [ -x "$ROOT/build/linux/ain" ]; then
+        AIN="$ROOT/build/linux/ain"
+    else
+        AIN="$ROOT/build/ain"
+    fi
+fi
 CORPUS="$ROOT/corpus"
 ARC="$ROOT/packed_corpus/ain22"
 VOL="$ARC/volumes"

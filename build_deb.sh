@@ -22,7 +22,11 @@ mkdir -p "${PKG_DIR}/usr/share/doc/ain"
 mkdir -p "${PKG_DIR}/DEBIAN"
 
 # Install binary
-cp -f "${SCRIPT_DIR}/build/ain" "${PKG_DIR}/usr/bin/ain"
+if [ -f "${SCRIPT_DIR}/build/linux/ain" ]; then
+    cp -f "${SCRIPT_DIR}/build/linux/ain" "${PKG_DIR}/usr/bin/ain"
+else
+    cp -L -f "${SCRIPT_DIR}/build/ain" "${PKG_DIR}/usr/bin/ain"
+fi
 chmod 755 "${PKG_DIR}/usr/bin/ain"
 
 # Documentation
@@ -50,7 +54,7 @@ Description: Pure C reimplementation of historical Transas AIN 2.32 archiver
  Features:
   - Compression modes M1 (Ultra), M2 (Normal), M3 (Fast), M4 (Store)
   - Multi-volume fragments (.ain, .a01, .a02...)
-  - Dual SFX generation: Linux native 64-bit ELF (.sfx) & DOS 16-bit (.exe)
+  - Triple SFX generation: Windows native PE 64-bit (.exe), Linux native ELF 64-bit (.sfx) & DOS 16-bit (.exe)
   - Selective extraction with wildcard pattern filtering
   - Path traversal & Zip-Slip protection
   - Historical digital preservation & software interoperability (EU 2009/24/EC)
