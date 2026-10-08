@@ -1,5 +1,6 @@
 # Build artifacts & packages
 build/
+dist/
 *.deb
 *.o
 .tmp_*
