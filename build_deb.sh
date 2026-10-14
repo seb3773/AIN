@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="${SCRIPT_DIR}/build/pkg_root"
-VERSION="2.32-1"
+VERSION="2.32.1-1"
 ARCH="amd64"
 DEB_NAME="ain_${VERSION}_${ARCH}.deb"
 
@@ -40,7 +40,7 @@ fi
 # DEBIAN/control
 cat << 'CTRL_EOF' > "${PKG_DIR}/DEBIAN/control"
 Package: ain
-Version: 2.32-1
+Version: 2.32.1-1
 Section: utils
 Priority: optional
 Architecture: amd64

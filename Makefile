@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra -Isrc
+CFLAGS ?= -O3 -flto -fomit-frame-pointer -Wall -Wextra -Isrc
 BUILD_DIR ?= build
 LINUX_DIR = $(BUILD_DIR)/linux
 WIN64_DIR = $(BUILD_DIR)/win64
@@ -13,7 +13,7 @@ CROSS_WIN64_CC ?= x86_64-w64-mingw32-gcc
 PREFIX ?= /usr/local
 DESTDIR ?=
 
-.PHONY: all linux win64 all-platforms clean update-linux-stub update-win-stub update-dos-stub install uninstall deb test help debug
+.PHONY: all linux win64 all-platforms clean update-linux-stub update-win-stub update-dos-stub install uninstall deb test help debug pgo
 
 all: linux
 
@@ -38,6 +38,21 @@ $(TARGET_WIN64): src/ain.c src/ain_sfx_stub.h src/ain_sfx_linux_stub.h src/ain_s
 
 debug: CFLAGS = -g -O0 -Wall -Wextra -Isrc
 debug: clean $(TARGET_LINUX)
+
+# Profile-guided optimization: train on corpus encodes, then rebuild.
+pgo: | $(LINUX_DIR)
+	$(CC) -O3 -flto -fomit-frame-pointer -fprofile-generate -fprofile-dir=$(BUILD_DIR)/pgo -Wall -Wextra -Isrc -o $(TARGET_LINUX) src/ain.c
+	@ln -sf linux/ain $(BUILD_DIR)/ain
+	@mkdir -p $(BUILD_DIR)/pgo
+	@echo "PGO training encode..."
+	@tmpdir=`mktemp -d`; \
+	  $(TARGET_LINUX) a -m1 "$$tmpdir/t1.ain" corpus/eng.txt corpus/image.raw corpus/mixed.bin corpus/zeros.bin corpus/records.bin corpus/pattern.bin corpus/code.c >/dev/null; \
+	  $(TARGET_LINUX) a -m2 "$$tmpdir/t2.ain" corpus/eng.txt corpus/image.raw corpus/mixed.bin >/dev/null; \
+	  $(TARGET_LINUX) a -m3 "$$tmpdir/t3.ain" corpus/eng.txt corpus/image.raw corpus/mixed.bin corpus/zeros.bin >/dev/null; \
+	  rm -rf "$$tmpdir"
+	$(CC) -O3 -flto -fomit-frame-pointer -fprofile-use -fprofile-correction -fprofile-dir=$(BUILD_DIR)/pgo -Wall -Wextra -Isrc -o $(TARGET_LINUX) src/ain.c
+	@ln -sf linux/ain $(BUILD_DIR)/ain
+	@echo "PGO build ready: $(TARGET_LINUX)"
 
 # Dev target: rebuild embedded Windows SFX stub header from src/ain_sfx_win_stub.c
 update-win-stub: src/ain_sfx_win_stub.c $(TARGET_LINUX)
@@ -68,6 +83,8 @@ test: $(TARGET_LINUX)
 	@echo "Running backward compatibility tests (AIN 2.22 & 2.2)..."
 	./tests/verify_ain222.sh
 	./tests/verify_ain22.sh
+	@echo "Running bit-exact encode + timing bench..."
+	./tests/bench_encode.sh
 	@echo "All tests passed successfully."
 
 install: $(TARGET_LINUX)
@@ -90,6 +107,7 @@ help:
 	@echo "  make win64      - Build Windows 64-bit binary (build/win64/ain.exe)"
 	@echo "  make all-platforms - Build both Linux and Windows binaries"
 	@echo "  make debug      - Build debug binary with symbols"
+	@echo "  make pgo        - Profile-guided optimized Linux build"
 	@echo "  make test       - Run verification against reference archives"
 	@echo "  make deb        - Build standalone Debian .deb package"
 	@echo "  make update-win-stub   - Rebuild and compress Win64 SFX stub header"

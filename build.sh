@@ -34,6 +34,10 @@ for arg in "$@"; do
             make deb
             exit 0
             ;;
+        pgo|--pgo)
+            make pgo
+            exit 0
+            ;;
         *)
             MAKE_ARGS+=("$arg")
             ;;

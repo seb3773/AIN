@@ -340,6 +340,11 @@ static void fill_table_ain(FillCtx *ctx, int bx, int di,
                            uint16_t ax, int depth)
 {
     if (depth > 16) return;
+    /* All symbols already placed: every remaining subtree is empty (no leaf,
+     * no fast[] entry).  Skip it — matches what the recursive fill would
+     * produce for a symbol-free region (nodes that were never written read
+     * back as 0, which is exactly the "stop" sentinel used by extract_code). */
+    if (ctx->si < 0) return;
     int d = bx >> 1;
     ctx->count[d]--;
     if (ctx->count[d] < 0) {
@@ -501,6 +506,80 @@ fallback:
     /* Symbol not in table (frequency=0) — should never happen */
     *code_out = 0;
     *len_out  = 1;
+}
+
+/* Per-symbol encode LUT:
+ *   - codes with length <= 8 come straight from fast[];
+ *   - longer codes are collected by walking each slow-path fast[] subtree
+ *     ONCE (instead of rescanning all 256 entries per symbol via
+ *     extract_code).  A tree value of 0 is ambiguous (sym 0 leaf vs an
+ *     unwritten/pruned slot), so any symbol still missing falls back to
+ *     extract_code(), which disambiguates using the expected length.
+ * Result is bit-identical to the per-symbol extract_code() loop. */
+static void huff_fill_enc(const HuffTable *tbl, const uint8_t *lengths, int n_syms,
+                          uint16_t *codes, uint8_t *clens)
+{
+    memset(codes, 0, (size_t)n_syms * sizeof(uint16_t));
+    memset(clens, 0, (size_t)n_syms);
+
+    for (int peek = 0; peek < 256; peek++) {
+        uint16_t e = tbl->fast[peek];
+        if (e == 0xFFFFu || e > 0x4777u) continue;
+        int s    = (int)(e & 0x7FFu);
+        int clen = (int)(e >> 11) & 0x1F;
+        if (s >= 0 && s < n_syms && clens[s] == 0 && lengths[s] == clen) {
+            codes[s] = (uint16_t)(peek & ((1 << clen) - 1));
+            clens[s] = (uint8_t)clen;
+        }
+    }
+
+    struct EncNode { int c; int depth; uint16_t code; };
+    struct EncNode stack[64];
+    for (int peek = 0; peek < 256; peek++) {
+        uint16_t e = tbl->fast[peek];
+        if (e == 0xFFFFu || e <= 0x4777u) continue;   /* not a slow-path root */
+        int sp = 0;
+        stack[sp].c = (int)(e & 0x7FFu);
+        stack[sp].depth = 0;
+        stack[sp].code = (uint16_t)peek;
+        sp++;
+        while (sp > 0) {
+            sp--;
+            int c        = stack[sp].c;
+            int depth    = stack[sp].depth;
+            uint16_t code = stack[sp].code;
+            if (depth >= 16) continue;
+            for (int bit = 0; bit < 2; bit++) {
+                int child = (int)tbl->tree[(c >> 1) + bit];
+                uint16_t ccode = (uint16_t)(code | ((uint16_t)bit << (8 + depth)));
+                if (child < 0) {
+                    int s = (int)(uint16_t)(-(int16_t)child);
+                    int L = 8 + depth + 1;
+                    if (s >= 0 && s < n_syms && clens[s] == 0 && lengths[s] == L) {
+                        codes[s] = (uint16_t)(ccode & ((1u << L) - 1u));
+                        clens[s] = (uint8_t)L;
+                    }
+                } else if (child > 0) {
+                    if (sp < 64) {
+                        stack[sp].c = child;
+                        stack[sp].depth = depth + 1;
+                        stack[sp].code = ccode;
+                        sp++;
+                    }
+                }
+                /* child == 0: unwritten or a sym-0 leaf; fall back below. */
+            }
+        }
+    }
+
+    for (int s = 0; s < n_syms; s++) {
+        if (lengths[s] && !clens[s]) {
+            uint16_t code; int clen;
+            extract_code(tbl, s, lengths[s], &code, &clen);
+            codes[s] = code;
+            clens[s] = (uint8_t)clen;
+        }
+    }
 }
 
 /* ======================================================================
@@ -890,11 +969,14 @@ static void write_block_table(BW *bw, const uint8_t *lengths, int n_syms)
     /* Write nm (9 bits) */
     bw_write(bw, (uint32_t)nm, 9);
 
+    uint16_t pre_code[N_SYMS_PRE];
+    uint8_t  pre_clen[N_SYMS_PRE];
+    huff_fill_enc(&g_pre_tbl, pre_lens, (int)N_SYMS_PRE, pre_code, pre_clen);
+
     /* Write each RLE symbol using the pre-code */
     for (int k = 0; k < nrle; k++) {
-        uint16_t code; int clen;
-        extract_code(&g_pre_tbl, rle[k].sym, pre_lens[rle[k].sym], &code, &clen);
-        bw_write(bw, code, clen);
+        int s = rle[k].sym;
+        bw_write(bw, pre_code[s], pre_clen[s]);
         if (rle[k].ebits)
             bw_write(bw, rle[k].extra, rle[k].ebits);
     }
@@ -978,28 +1060,41 @@ static uint16_t lz_hash_m3(const uint8_t *p)
  *   - on mismatch: sub al,1 / adc di,0  (count +1 if low byte matched)
  *   - stop when di >= max_di (= MIN(avail, 256))
  * Returns total match length (including the 4 initial bytes). */
+/* Longest common prefix, capped at n.  Word-by-word DOS cmpsw / "low byte
+ * on mismatch counts +1" is identical to a byte LCP, so SIMD is bit-exact.
+ * src is zero-padded past EOF (see compress_session). */
+static inline int ain_lcp(const uint8_t *a, const uint8_t *b, int n)
+{
+    int i = 0;
+    if (n <= 0) return 0;
+    /* 8-byte SWAR: cheapest reject for the common short-match case.
+     * Measured faster than a 16-byte SSE2 loop here (matches are usually
+     * short, so movemask/align overhead dominates). Long runs are handled
+     * by the scalar tail. */
+    while (i + 8 <= n) {
+        uint64_t xa, xb;
+        memcpy(&xa, a + i, 8);
+        memcpy(&xb, b + i, 8);
+        uint64_t d = xa ^ xb;
+        if (d)
+            return i + (int)(__builtin_ctzll(d) >> 3);
+        i += 8;
+    }
+    while (i < n && a[i] == b[i]) i++;
+    return i;
+}
+
 static int dos_m3_extend_phys(const uint8_t *src, size_t src_size,
                                uint32_t phys_bp, uint32_t phys_cand, int avail)
 {
+    (void)src_size;
     int di     = 4;              /* 4 bytes already matched */
     int max_di = (avail < (int)MAX_MATCH) ? avail : (int)MAX_MATCH;
-
-    while (di < max_di) {
-        uint32_t bi = phys_bp   + (unsigned)di;
-        uint32_t ci = phys_cand + (unsigned)di;
-        uint8_t  b0 = (bi   < src_size) ? src[bi]   : 0u;
-        uint8_t  b1 = (bi+1 < src_size) ? src[bi+1] : 0u;
-        uint8_t  c0 = (ci   < src_size) ? src[ci]   : 0u;
-        uint8_t  c1 = (ci+1 < src_size) ? src[ci+1] : 0u;
-        uint16_t wbp   = (uint16_t)(b0 | ((uint16_t)b1 << 8));
-        uint16_t wcand = (uint16_t)(c0 | ((uint16_t)c1 << 8));
-        if (wbp != wcand) {
-            /* sub al,1 / adc di,0: +1 if low byte matched */
-            if ((uint8_t)(wbp & 0xFF) == (uint8_t)(wcand & 0xFF)) di++;
-            break;
-        }
-        di += 2;
-    }
+    if (di >= max_di) return max_di;
+    /* Word cmpsw + low-byte leftover == byte LCP from offset 4. */
+    di += ain_lcp(src + phys_bp + (unsigned)di,
+                  src + phys_cand + (unsigned)di,
+                  max_di - di);
     if (di > max_di) di = max_di;
     return di;
 }
@@ -1409,20 +1504,15 @@ static void lz12_extend(LZ12State *lz,
         /* byte 1 matched: proceed with extension from byte 2 (same as DOS) */
     }
 
-    /* Extension: compare word by word from 'from', up to max_words pairs. */
-    int len = from; /* start of extension */
+    /* Extension: byte LCP from 'from', up to max_words pairs.
+     * Identical to DOS repe cmpsw + leftover-byte (cl/sbb) adjust. */
     int max_ext = from + max_words * 2;
     if (max_ext > avail) max_ext = avail;
-
-    /* Word-by-word comparison (mirrors repe cmpsw). */
-    while (len + 1 < max_ext) {
-        if (lz->src[phys_cand + len]     != lz->src[pos_emit + len])     break;
-        if (lz->src[phys_cand + len + 1] != lz->src[pos_emit + len + 1]) { len++; break; }
-        len += 2;
-    }
-    /* Single-byte check at end (mirrors the cl/sbb byte-adjust in D373). */
-    if (len < max_ext && lz->src[phys_cand + len] == lz->src[pos_emit + len])
-        len++;
+    int len = from;
+    if (max_ext > from)
+        len += ain_lcp(lz->src + phys_cand + from,
+                       lz->src + pos_emit + from,
+                       max_ext - from);
 
     /* For d420: len = stopping position from offset 0 (starts at 2, counts from there).
      * DOS formula (D487): cx = 1 + 2N - CF = total match length including byte 0.
@@ -1533,30 +1623,13 @@ d468:
         size_t   pc        = (size_t)pc_s;
         uint16_t bx_pos_u  = (uint16_t)((uint16_t)bx + (uint16_t)(uint16_t)ax_saved);
 
-        /* D468–D4A7: extend + update best */
+        /* D468–D4A7: extend + update best.
+         * lz12_extend already computed the LCP; reuse it as cx_match. */
         int old_best = best;
         lz12_extend(lz, pc, pos_emit, bx_pos_u, &best, 1 /* d420 */);
         if (lz->cur_len >= 256) return;                    /* D44D: max-length, ret */
-
-        int cx_match;
-        {
-            int avail_c = (sz > pc)        ? (int)(sz - pc)        : 0;
-            int avail_p = (sz > pos_emit)  ? (int)(sz - pos_emit)  : 0;
-            int avail   = (avail_c < avail_p ? avail_c : avail_p);
-            if (avail > 256) avail = 256;
-            int len = 2, max_ext = 2 + 0x7F * 2;
-            if (max_ext > avail) max_ext = avail;
-            while (len + 1 < max_ext) {
-                if (lz->src[pc + len]     != lz->src[pos_emit + len])     break;
-                if (lz->src[pc + len + 1] != lz->src[pos_emit + len + 1]) { len++; break; }
-                len += 2;
-            }
-            if (len < max_ext && len < 256 &&
-                    lz->src[pc + len] == lz->src[pos_emit + len]) len++;
-            cx_match = len;
-        }
-
         if (best == old_best) goto d4e4;  /* not better: D497 jng D4E4 */
+        int cx_match = best;
 
         /* ---- D4A8–D4E0: secondary chain lookup ---- */
         uint16_t sec_slot = (uint16_t)((uint16_t)bp + (uint16_t)cx_match - 257u);
@@ -1694,11 +1767,12 @@ d330_entry:
 d360:
     {
         size_t cand_phys = pos_emit - (size_t)(uint16_t)(pos_raw - bx);
-        int cand_len = 0;
-        while (cand_len < 256 && cand_phys + cand_len < sz && pos_emit + cand_len < sz &&
-               lz->src[cand_phys + cand_len] == lz->src[pos_emit + cand_len]) {
-            cand_len++;
-        }
+        int lim = 256;
+        if (cand_phys >= sz) lim = 0;
+        else if (sz - cand_phys < (size_t)lim) lim = (int)(sz - cand_phys);
+        if (pos_emit >= sz) lim = 0;
+        else if (sz - pos_emit < (size_t)lim) lim = (int)(sz - pos_emit);
+        int cand_len = (lim > 0) ? ain_lcp(lz->src + cand_phys, lz->src + pos_emit, lim) : 0;
         if (cand_len >= 256) {
             lz->cur_len = 256;
             lz->cur_pos = bx;
@@ -2023,35 +2097,33 @@ static void write_block(BW *bw,
     build_huffman_table(&g_sym_tbl,  sym_lens,  (int)N_SYMS_LIT);
     build_huffman_table(&g_dist_tbl, dist_lens, (int)N_SYMS_DIST);
 
+    uint16_t sym_code[N_SYMS_LIT], dist_code[N_SYMS_DIST];
+    uint8_t  sym_clen[N_SYMS_LIT], dist_clen[N_SYMS_DIST];
+    huff_fill_enc(&g_sym_tbl,  sym_lens,  (int)N_SYMS_LIT,  sym_code,  sym_clen);
+    huff_fill_enc(&g_dist_tbl, dist_lens, (int)N_SYMS_DIST, dist_code, dist_clen);
+
     /* Write tokens */
     for (int i = 0; i < ntok; i++) {
-        uint16_t code; int clen;
         if (!tokens[i].is_match) {
-            extract_code(&g_sym_tbl, tokens[i].lit, sym_lens[tokens[i].lit], &code, &clen);
-            bw_write(bw, code, clen);
+            int s = tokens[i].lit;
+            bw_write(bw, sym_code[s], sym_clen[s]);
         } else {
             int D; uint16_t extra; int ebits;
             dist_to_D(tokens[i].dist, &D, &extra, &ebits);
 
-            extract_code(&g_sym_tbl, 256 + D, sym_lens[256 + D], &code, &clen);
-            bw_write(bw, code, clen);
+            bw_write(bw, sym_code[256 + D], sym_clen[256 + D]);
             if (ebits) bw_write(bw, extra, ebits);
 
             int lsym = (int)tokens[i].length - 3;
             if (lsym < 0) lsym = 0;
             if (lsym >= (int)N_SYMS_DIST) lsym = (int)N_SYMS_DIST - 1;
-            extract_code(&g_dist_tbl, lsym, dist_lens[lsym], &code, &clen);
-            bw_write(bw, code, clen);
+            bw_write(bw, dist_code[lsym], dist_clen[lsym]);
         }
     }
 
     /* Write EOB: sym=271 (D=15), then 14 bits = 0x3FFF */
-    {
-        uint16_t code; int clen;
-        extract_code(&g_sym_tbl, 256+15, sym_lens[256+15], &code, &clen);
-        bw_write(bw, code, clen);
-        bw_write(bw, 0x3FFFu, 14);
-    }
+    bw_write(bw, sym_code[256+15], sym_clen[256+15]);
+    bw_write(bw, 0x3FFFu, 14);
 
     /* End-of-session bit: 1 = last block, 0 = more blocks follow */
     bw_write(bw, is_last_block ? 1u : 0u, 1);
@@ -2068,6 +2140,17 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
 
     /* Session bit (always 0) */
     bw_write(bw, 0u, 1);
+
+    /* Zero-pad past EOF so match-extend can peek words without bounds checks.
+     * Length stays `size`; pad bytes are never emitted as literals. */
+    uint8_t *padded = NULL;
+    if (size > 0) {
+        padded = malloc(size + MAX_MATCH + 4);
+        if (!padded) return;
+        memcpy(padded, data, size);
+        memset(padded + size, 0, MAX_MATCH + 4);
+        data = padded;
+    }
 
     if (size == 0) {
         /* Empty file: single empty block with only EOB.
@@ -2298,6 +2381,7 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
     }
 
     free(tokens);
+    free(padded);
 }
 
 /* ======================================================================

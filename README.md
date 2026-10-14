@@ -42,10 +42,11 @@ Using the build script:
 Or using `make`:
 
 ```sh
-make                  # Compile Linux binary into build/linux/ain
+make                  # Compile Linux binary into build/linux/ain (-O3 -flto)
+make pgo              # Build with Profile-Guided Optimization (trained in ~6s)
 make win64            # Cross-compile Windows 64-bit static binary into build/win64/ain.exe
 make all-platforms    # Compile both Linux and Windows binaries
-make test             # Run test suite
+make test             # Run test suite and encode benchmark
 make deb              # Build Debian package
 sudo make install     # Install binary to /usr/local/bin
 ```
@@ -55,11 +56,11 @@ Or manually:
 ```sh
 # Linux
 mkdir -p build/linux
-gcc -O2 -Wall -Wextra -Isrc -o build/linux/ain src/ain.c
+gcc -O3 -flto -fomit-frame-pointer -Wall -Wextra -Isrc -o build/linux/ain src/ain.c
 
 # Windows 64-bit (via MinGW-w64)
 mkdir -p build/win64
-x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -Isrc -static -o build/win64/ain.exe src/ain.c
+x86_64-w64-mingw32-gcc -O3 -flto -fomit-frame-pointer -Wall -Wextra -Isrc -static -o build/win64/ain.exe src/ain.c
 ```
 
 ---

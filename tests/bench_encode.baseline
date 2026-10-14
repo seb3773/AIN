@@ -1,0 +1,8 @@
+# Median encode times (seconds) for a given synthetic payload.
+# SIZE is the payload byte count; compare runs via throughput
+# (bytes/second) since the payload auto-scales per CPU speed.
+SIZE 36367360
+M1 9.3089
+M2 7.4529
+M3 5.4468
+M4 0.5845
