@@ -13,7 +13,7 @@ CROSS_WIN64_CC ?= x86_64-w64-mingw32-gcc
 PREFIX ?= /usr/local
 DESTDIR ?=
 
-.PHONY: all linux win64 all-platforms clean update-linux-stub update-win-stub update-dos-stub install uninstall deb test help debug pgo
+.PHONY: all linux win64 all-platforms clean update-linux-stub update-win-stub update-dos-stub install uninstall deb test help debug pgo perf-gate perf-timing
 
 all: linux
 
@@ -101,6 +101,15 @@ deb:
 clean:
 	rm -rf $(BUILD_DIR) *.o .tmp_* *.deb
 
+# Encoder optimisation gate: bit-exact vs the legacy encoder (git rev
+# AIN_REF_REV, default 3ab90bc) incl. per-search self-check builds.
+perf-gate:
+	./tests/perf/gate.sh
+
+# Same gate + interleaved A/B timing (ref vs working tree).
+perf-timing:
+	./tests/perf/gate.sh --timing
+
 help:
 	@echo "AIN 2.32 Archiver build targets:"
 	@echo "  make            - Build Linux binary (build/linux/ain)"
@@ -109,6 +118,8 @@ help:
 	@echo "  make debug      - Build debug binary with symbols"
 	@echo "  make pgo        - Profile-guided optimized Linux build"
 	@echo "  make test       - Run verification against reference archives"
+	@echo "  make perf-gate  - Bit-exact gate vs legacy encoder (+ self-check builds)"
+	@echo "  make perf-timing - perf-gate + A/B encode timing vs legacy encoder"
 	@echo "  make deb        - Build standalone Debian .deb package"
 	@echo "  make update-win-stub   - Rebuild and compress Win64 SFX stub header"
 	@echo "  make update-linux-stub - Rebuild and compress Linux SFX stub header"

@@ -61,6 +61,7 @@ pairs = [
     ("empty.dat",   "EMPTY-M3.AIN",   3),
     ("empty.dat",   "EMPTY-M4.AIN",   4),
     ("code.c",      "CODE.AIN",       3),
+    ("records.bin", "RECORDS.AIN",    2),
 ]
 
 print("=== Bit-exact encode vs packed_corpus (compressed stream) ===")

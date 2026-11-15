@@ -47,6 +47,8 @@ make pgo              # Build with Profile-Guided Optimization (trained in ~6s)
 make win64            # Cross-compile Windows 64-bit static binary into build/win64/ain.exe
 make all-platforms    # Compile both Linux and Windows binaries
 make test             # Run test suite and encode benchmark
+make perf-gate        # Bit-exact gate of the encoder vs the legacy encoder (see tests/perf/)
+make perf-timing      # perf-gate + A/B timing vs the legacy encoder
 make deb              # Build Debian package
 sudo make install     # Install binary to /usr/local/bin
 ```

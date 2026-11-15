@@ -47,6 +47,9 @@
 #else
 #define ain_mkdir(p) mkdir(p, 0755)
 #endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include "ain_sfx_stub.h"
 #include "ain_sfx_linux_stub.h"
 #include "ain_sfx_win_stub.h"
@@ -294,6 +297,7 @@ typedef struct {
     uint16_t fast[256];
     int16_t  tree[8192];
     int      tree_next;
+    int      tree_hwm;   /* tree[tree_hwm..] is known to be all zero */
 } HuffTable;
 
 static void sort_symbols_ain(const uint8_t *lengths, int n_sym,
@@ -350,7 +354,10 @@ static void fill_table_ain(FillCtx *ctx, int bx, int di,
     if (ctx->count[d] < 0) {
         int dx = ctx->dx;
         ctx->dx += 4;
-        if (di >> 1 < 8192) ctx->tbl->tree[di >> 1] = (int16_t)dx;
+        if (di >> 1 < 8192) {
+            ctx->tbl->tree[di >> 1] = (int16_t)dx;
+            if ((di >> 1) >= ctx->tbl->tree_hwm) ctx->tbl->tree_hwm = (di >> 1) + 1;
+        }
         if (d == 8) {
             int wi = (int)(rol16(ax, 8) & 0xFFu);
             ctx->tbl->fast[wi] = (uint16_t)((unsigned)dx | 0xF800u);
@@ -361,7 +368,10 @@ static void fill_table_ain(FillCtx *ctx, int bx, int di,
     }
     if (ctx->si < 0) return;
     int sym = (int)ctx->ss[ctx->si--];
-    if (di >> 1 < 8192) ctx->tbl->tree[di >> 1] = (int16_t)(-(int16_t)sym);
+    if (di >> 1 < 8192) {
+        ctx->tbl->tree[di >> 1] = (int16_t)(-(int16_t)sym);
+        if ((di >> 1) >= ctx->tbl->tree_hwm) ctx->tbl->tree_hwm = (di >> 1) + 1;
+    }
     if (d > 8) return;
     int      cl   = d + 1;
     uint16_t di_s = rol16(ax, cl);
@@ -381,7 +391,9 @@ static void build_huffman_table(HuffTable *tbl,
      * per session (at session start), never between blocks.  Only tree[] is
      * cleared per block.  This is critical: extract_code() reads codes from
      * fast[], which must reflect exactly what the decompressor sees. */
-    memset(tbl->tree, 0,    sizeof(tbl->tree));
+    /* Same as clearing all of tree[]: only [0, tree_hwm) can be non-zero. */
+    memset(tbl->tree, 0, (size_t)tbl->tree_hwm * sizeof(tbl->tree[0]));
+    tbl->tree_hwm  = 0;
     tbl->tree_next = 2;
 
     int freq[17] = {0};
@@ -637,17 +649,41 @@ static void dos_counting_sort(const uint32_t *freq, const int *syms, int n,
 {
     /* Replicates DOS D8EA radix sort tie-breaking:
      * ascending freq, ascending sym index on tie. */
-    for (int i = 0; i < n; i++) sorted[i] = syms[i];
-    for (int i = 1; i < n; i++) {
-        int tmp = sorted[i];
-        int j = i - 1;
-        while (j >= 0) {
-            uint32_t fj = freq[sorted[j]], ft = freq[tmp];
-            if (fj > ft || (fj == ft && sorted[j] > tmp)) {
-                sorted[j + 1] = sorted[j]; j--;
-            } else break;
+    /* (freq, sym) is a strict total order, so any correct sort gives the
+     * same permutation.  syms[] arrives in ascending sym order, hence a
+     * stable LSD radix sort on freq (8 bits per pass) is exact. */
+    uint32_t maxf = 0;
+    for (int i = 0; i < n; i++) if (freq[syms[i]] > maxf) maxf = freq[syms[i]];
+    if (n > 544 || maxf >= (1u << 24)) {          /* never in practice */
+        for (int i = 0; i < n; i++) sorted[i] = syms[i];
+        for (int i = 1; i < n; i++) {
+            int tmp = sorted[i];
+            int j = i - 1;
+            while (j >= 0) {
+                uint32_t fj = freq[sorted[j]], ft = freq[tmp];
+                if (fj > ft || (fj == ft && sorted[j] > tmp)) {
+                    sorted[j + 1] = sorted[j]; j--;
+                } else break;
+            }
+            sorted[j + 1] = tmp;
         }
-        sorted[j + 1] = tmp;
+        return;
+    }
+    int tmp[544];
+    const int *src = syms;
+    int *bufs[2] = { tmp, sorted };
+    int passes = maxf < 256u ? 1 : (maxf < 65536u ? 2 : 3);
+    /* final pass must land in sorted[]: alternate starting buffer */
+    int b = (passes & 1) ? 1 : 0;
+    for (int ps = 0; ps < passes; ps++) {
+        int cnt[257];
+        memset(cnt, 0, sizeof(cnt));
+        int sh = 8 * ps;
+        for (int i = 0; i < n; i++) cnt[((freq[src[i]] >> sh) & 0xFFu) + 1]++;
+        for (int k = 0; k < 256; k++) cnt[k + 1] += cnt[k];
+        int *dst = bufs[b];
+        for (int i = 0; i < n; i++) dst[cnt[(freq[src[i]] >> sh) & 0xFFu]++] = src[i];
+        src = dst; b ^= 1;
     }
 }
 
@@ -664,9 +700,11 @@ static void dos_build_depth_count(const uint32_t *freq, const int *sorted,
 
     /* Pool: (2n-1) nodes × 4 bytes each. */
     int pool_nodes = 2 * n - 1;
-    uint16_t *pfreq = malloc((size_t)pool_nodes * sizeof(uint16_t));
-    uint16_t *plink = malloc((size_t)pool_nodes * sizeof(uint16_t));
-    if (!pfreq || !plink) { free(pfreq); free(plink); return; }
+    uint16_t pfreq_s[2 * 544], plink_s[2 * 544];
+    int heap = pool_nodes > 2 * 544;
+    uint16_t *pfreq = heap ? malloc((size_t)pool_nodes * sizeof(uint16_t)) : pfreq_s;
+    uint16_t *plink = heap ? malloc((size_t)pool_nodes * sizeof(uint16_t)) : plink_s;
+    if (!pfreq || !plink) { if (heap) { free(pfreq); free(plink); } return; }
 
     /* di = write ptr (node index), si = Q2 read ptr (node index).
      * In DOS these are byte offsets (×4); we use node indices here and
@@ -709,8 +747,9 @@ static void dos_build_depth_count(const uint32_t *freq, const int *sorted,
     memset(depth_count, 0, (size_t)(max_depth + 1) * sizeof(int));
     /* Stack: (node_index, depth) pairs */
     int  stk_cap = pool_nodes * 2 + 4;
-    int *stk_node  = malloc((size_t)stk_cap * sizeof(int));
-    int *stk_depth = malloc((size_t)stk_cap * sizeof(int));
+    int  stk_node_s[4 * 544 + 4], stk_depth_s[4 * 544 + 4];
+    int *stk_node  = heap ? malloc((size_t)stk_cap * sizeof(int)) : stk_node_s;
+    int *stk_depth = heap ? malloc((size_t)stk_cap * sizeof(int)) : stk_depth_s;
     int top = 0;
     /* D996 walker starts with si=0xFFFE (-2), so root is at "depth -1".
      * Children of root get si=0 (depth 0), depth_count[0]++, code_len = 0+1 = 1.
@@ -731,10 +770,12 @@ static void dos_build_depth_count(const uint32_t *freq, const int *sorted,
             stk_node[top] = lc;     stk_depth[top] = d + 1; top++;
         }
     }
-    free(stk_node);
-    free(stk_depth);
-    free(pfreq);
-    free(plink);
+    if (heap) {
+        free(stk_node);
+        free(stk_depth);
+        free(pfreq);
+        free(plink);
+    }
 }
 
 static void huffman_lengths(const uint32_t *freq, int n_syms,
@@ -748,7 +789,17 @@ static void huffman_lengths(const uint32_t *freq, int n_syms,
         if (freq[i]) syms[n++] = i;
 
     if (n == 0) return;
-    if (n == 1) { lengths[syms[0]] = 1; return; }
+    if (n == 1) {
+        /* DOS DA12-DA19 quirk: when only 1 symbol has non-zero frequency,
+         * DOS takes the last 2 entries of sorted[]. The last entry is syms[0],
+         * and the second-to-last is the last symbol of the freq=0 list.
+         * Both receive length=1. For dist_tbl (n_syms=254) with syms[0]=0,
+         * this forces sym 253 to length=1, keeping nm=0. */
+        lengths[syms[0]] = 1;
+        int dummy = (syms[0] == n_syms - 1) ? (n_syms - 2) : (n_syms - 1);
+        lengths[dummy] = 1;
+        return;
+    }
 
     /* Step 1: Counting-sort — produces sorted[0..n-1] freq ascending,
      * ties broken by descending symbol index. */
@@ -799,7 +850,7 @@ typedef struct {
     uint8_t *data;
     size_t   cap;
     size_t   pos;
-    uint32_t buf;
+    uint64_t buf;
     int      nbits;
 } BW;
 
@@ -820,26 +871,33 @@ static void bw_ensure(BW *bw, size_t extra)
     }
 }
 
-static void bw_write(BW *bw, uint32_t val, int n)
+/* LSB-first bit writer.  64-bit accumulator, flushed 32 bits at a time:
+ * the byte stream is identical to a byte-at-a-time writer (n <= 32). */
+static inline void bw_write(BW *bw, uint32_t val, int n)
 {
-    if (n == 0) return;
-    bw->buf   |= (val & ((1u << n) - 1u)) << bw->nbits;
+    bw->buf   |= (uint64_t)(val & (uint32_t)((1ull << n) - 1u)) << bw->nbits;
     bw->nbits += n;
-    while (bw->nbits >= 8) {
-        bw_ensure(bw, 1);
-        bw->data[bw->pos++] = (uint8_t)(bw->buf & 0xFFu);
-        bw->buf   >>= 8;
-        bw->nbits  -= 8;
+    if (bw->nbits >= 32) {
+        if (bw->pos + 4 > bw->cap) bw_ensure(bw, 4);
+        uint32_t w = (uint32_t)bw->buf;
+        uint8_t *d = bw->data + bw->pos;
+        d[0] = (uint8_t)w; d[1] = (uint8_t)(w >> 8);
+        d[2] = (uint8_t)(w >> 16); d[3] = (uint8_t)(w >> 24);
+        bw->pos   += 4;
+        bw->buf  >>= 32;
+        bw->nbits -= 32;
     }
 }
 
 static void bw_flush(BW *bw)
 {
-    if (bw->nbits > 0) {
+    while (bw->nbits > 0) {
         bw_ensure(bw, 1);
         bw->data[bw->pos++] = (uint8_t)(bw->buf & 0xFFu);
-        bw->buf = 0; bw->nbits = 0;
+        bw->buf  >>= 8;
+        bw->nbits -= 8;
     }
+    bw->buf = 0; bw->nbits = 0;
 }
 
 /* ======================================================================
@@ -948,7 +1006,9 @@ static void write_block_table(BW *bw, const uint8_t *lengths, int n_syms)
     /* Build RLE sequence and count pre-code symbol frequencies */
     uint32_t pre_freq[N_SYMS_PRE];
     memset(pre_freq, 0, sizeof(pre_freq));
-    RLESym *rle = malloc((size_t)(active + 4) * sizeof(RLESym));
+    RLESym  rle_s[N_SYMS_LIT + 4];
+    RLESym *rle = (active + 4 <= (int)(N_SYMS_LIT + 4)) ? rle_s
+                : malloc((size_t)(active + 4) * sizeof(RLESym));
     int     nrle = encode_lengths_rle(lengths, active, rle, pre_freq);
 
     /* Ensure at least one active pre-code symbol to avoid empty table */
@@ -981,7 +1041,7 @@ static void write_block_table(BW *bw, const uint8_t *lengths, int n_syms)
             bw_write(bw, rle[k].extra, rle[k].ebits);
     }
 
-    free(rle);
+    if (rle != rle_s) free(rle);
 }
 
 /* ======================================================================
@@ -1084,6 +1144,14 @@ static inline int ain_lcp(const uint8_t *a, const uint8_t *b, int n)
     return i;
 }
 
+/* 4-byte equality (both ranges are inside the input). */
+static inline int ain_eq4(const uint8_t *a, const uint8_t *b)
+{
+    uint32_t x, y;
+    memcpy(&x, a, 4); memcpy(&y, b, 4);
+    return x == y;
+}
+
 static int dos_m3_extend_phys(const uint8_t *src, size_t src_size,
                                uint32_t phys_bp, uint32_t phys_cand, int avail)
 {
@@ -1171,9 +1239,10 @@ static void lz_slide(LZState *lz, uint16_t bp)
     /* BST sweep: if (int16_t)w < (int16_t)ax → w = ax */
     uint16_t *words = (uint16_t *)&lz->bst;
     int nwords = (int)(sizeof(lz->bst) / sizeof(uint16_t)); /* 2*BST_SLOTS = 32768 */
+    /* Branch-free form (w = max_signed(w, ax)) so the compiler vectorizes it. */
     for (int i = 0; i < nwords; i++) {
-        if ((int16_t)words[i] < (int16_t)ax)
-            words[i] = ax;
+        int16_t w = (int16_t)words[i];
+        words[i] = (uint16_t)(w < (int16_t)ax ? (int16_t)ax : w);
     }
 
     /* On even slides (ax=0x8000): bp just wrapped past 0xFFFF → advance lap_base.
@@ -1233,9 +1302,7 @@ static int lz_find_and_insert(LZState *lz, uint16_t bp, int *match_dist_out)
         if (dist_back > 0 && dist_back <= (int)WINDOW_SIZE) {
             uint32_t pc = phys_bp - (unsigned)dist_back;
             if (phys_bp >= (unsigned)dist_back &&
-                pc+3 < src_sz &&
-                src[pc]==src[phys_bp] && src[pc+1]==src[phys_bp+1] &&
-                src[pc+2]==src[phys_bp+2] && src[pc+3]==src[phys_bp+3])
+                pc+3 < src_sz && ain_eq4(src + pc, src + phys_bp))
             {
                 int len = dos_m3_extend_phys(src, src_sz, phys_bp, pc, (int)avail);
                 if (len > best_len) { best_len = len; best_pos = cand; }
@@ -1273,9 +1340,7 @@ static int lz_find_and_insert(LZState *lz, uint16_t bp, int *match_dist_out)
                 }
                 /* Path B: no D0FB check — do_test stays 1 */
                 if (do_test &&
-                    pc+3 < src_sz &&
-                    src[pc]==src[phys_bp] && src[pc+1]==src[phys_bp+1] &&
-                    src[pc+2]==src[phys_bp+2] && src[pc+3]==src[phys_bp+3])
+                    pc+3 < src_sz && ain_eq4(src + pc, src + phys_bp))
                 {
                     int len = dos_m3_extend_phys(src, src_sz, phys_bp, pc, (int)avail);
                     if (len > best_len) { best_len = len; best_pos = cand; }
@@ -1350,7 +1415,87 @@ typedef struct {
     uint16_t       prv_len;   /* [C83A]: best match length from previous iteration */
     uint16_t       prv_pos;   /* [C83C]: best match bp from previous iteration */
     int            method;
+    size_t         ins_pos;   /* sequential input stream position for DOS rolling hash */
+    /* ---- Exact accelerator for the D318 si=0 chain walk (see lz12_fast_*) ---- */
+    int            fast;      /* accelerator enabled for this session */
+    uint32_t       ins_abs;   /* absolute (non-wrapping) bp of the next insert, + M12F_BASE */
+    struct M12FastIdx *fx;
 } LZ12State;
+
+/* ======================================================================
+ * M1/M2 accelerator — "same pair" skip index (bit-exact, encoder-only).
+ *
+ * Profiling shows the D318 walk with si=0 (looking for the first chain node
+ * whose word at offset 0 equals the word at pos_emit) is 75-85% of all chain
+ * hops on files > 64 KB, with a hit rate < 1%.  That search has a closed form:
+ *
+ *   the walk starts at chain[p] where p is a node of bucket h whose key
+ *   (word at its physical position) is T = ax_word: p = pos_raw initially,
+ *   or the last hit node after a non-improving hit (D394).  The first hit
+ *   is therefore the most recent node *older than p* with the same
+ *   (bucket h, key T) pair — computed once per node at insert time (kn).
+ *
+ * The hop index of that node in the walk is the difference of per-bucket
+ * insert counters (cnt), which lets us replay the DOS dx budget exactly,
+ * including the quirk that only hop 1 of each 3-hop group tests dx < 0.
+ * Chain breaks (terminator links) add a counter gap > any dx budget.
+ * Reachability uses absolute ages: chain ages grow monotonically with steps
+ * < 0x8000, so the 16-bit "js" exit fires exactly at the first node whose
+ * absolute age is >= 0x8000.
+ *
+ * The pair -> most-recent-node map is a set-associative cache.  When a live
+ * entry was evicted inside the age window the result is KN_UNKNOWN and the
+ * walk falls back to the legacy hop loop, so the answer is always exact.
+ * ==================================================================== */
+#define M12F_BASE      0x00100000u  /* abs = M12F_BASE + absolute bp (≡ bp mod 65536) */
+#define M12F_GAP       0x00100000u  /* cnt jump on chain break (> any dx budget) */
+#define KN_NONE        0u           /* "no node": age is huge, always unreachable */
+#define KN_UNKNOWN     1u           /* map overflow: use the legacy walk */
+#ifndef M12F_SETS_LOG           /* overridable: tiny maps stress the fallback path */
+#define M12F_SETS_LOG  14
+#endif
+#define M12F_SETS      (1u << M12F_SETS_LOG)
+#ifndef M12F_WAYS
+#define M12F_WAYS      8
+#endif
+/* Minimum session size for the accelerator.  Below 64 KB the rolling hash
+ * reads the right bytes and si=0 chains are short, so the index does not pay
+ * for its setup.  Exactness does not depend on this value (tests force 0). */
+#ifndef M12F_MIN_SIZE
+#define M12F_MIN_SIZE  0x10000u
+#endif
+
+typedef struct { uint32_t kn; uint32_t cnt; } M12FNode;
+typedef struct { uint32_t abs[M12F_WAYS]; uint32_t pair[M12F_WAYS]; } M12FSet;
+
+struct M12FastIdx {
+    M12FNode node[M12_CHAIN_SIZE];       /* per 16-bit bp: next same-pair node + bucket ordinal */
+    uint32_t bcnt[M12_HASH_SLOTS];       /* per-bucket insert ordinal of the last node */
+    uint32_t habs[M12_HASH_SLOTS];       /* abs of the last node inserted per bucket (0 = none) */
+    uint32_t evict[M12F_SETS];           /* most recent abs of a live entry evicted per set */
+    M12FSet  set[M12F_SETS];
+};
+
+/* Encoder work buffers, allocated once and reused by every session.
+ * Per-file malloc/free of these large blocks made glibc trim and regrow the
+ * heap for each file (measurable kernel time on archives of small files).
+ * All of them are fully re-initialised per session, so reuse is invisible. */
+static struct {
+    LZ12State          *lz12;
+    LZState            *lz3;
+    void               *tokens;     /* Token[TOKEN_STACK_LIMIT + 4] */
+    uint8_t            *pad;
+    size_t              pad_cap;
+    struct M12FastIdx  *fx;
+} g_enc;
+
+static void enc_cache_free(void)
+{
+    free(g_enc.lz12); free(g_enc.lz3); free(g_enc.tokens);
+    free(g_enc.pad);  free(g_enc.fx);
+    memset(&g_enc, 0, sizeof(g_enc));
+}
+
 
 /* DOS raw-address read: DS:[addr] where file is loaded at DS:0x100.
  * So DS:[addr] = file[addr - 0x100] = src[addr - 0x100].
@@ -1383,6 +1528,7 @@ static void lz12_init(LZ12State *lz, const uint8_t *data, size_t size, int metho
     lz->slide_sentinel = M12_NIL;
     lz->cur_len = lz->cur_pos = 0;
     lz->prv_len = lz->prv_pos = 0;
+    lz->ins_pos = 0;
     /* CD1D: hash table filled with 0x8100 (M12_NIL), 0x1000 entries */
     for (unsigned i = 0; i < M12_HASH_SLOTS; i++)
         lz->hash[i] = (uint16_t)M12_NIL;
@@ -1392,6 +1538,16 @@ static void lz12_init(LZ12State *lz, const uint8_t *data, size_t size, int metho
     for (unsigned i = 0; i < M12_CHAIN_SIZE; i++)
         lz->chain[i] = 0;
     lz->chain[0x00FFu] = 0x80FFu;
+
+    lz->fast = 0;
+    lz->fx   = NULL;
+    lz->ins_abs = M12F_BASE + 0x00FEu;  /* first insert below is bp=0x00FE */
+    if (size + 1u > (size_t)M12F_MIN_SIZE && size < 0x7FF00000u) {
+        if (!g_enc.fx) g_enc.fx = calloc(1, sizeof(struct M12FastIdx));
+        else memset(g_enc.fx, 0, sizeof(struct M12FastIdx));
+        lz->fx = g_enc.fx;
+        lz->fast = lz->fx != NULL;
+    }
 
     /* CE61–CF19: pre-scan loop.
      * CE3A: bp=0x100. CE61: bp-=3 → bp=0xFD. CE57: dx=0x103.
@@ -1414,9 +1570,91 @@ static void lz12_slide(LZ12State *lz, uint16_t bp)
     uint16_t ax = (uint16_t)(bp - 0x8000u);
     lz->slide_sentinel = ax;
     for (unsigned i = 0; i < M12_HASH_SLOTS; i++) {
-        if ((int16_t)((uint16_t)(lz->hash[i] - ax)) < 0)
-            lz->hash[i] = ax;
+        uint16_t h = lz->hash[i];
+        lz->hash[i] = ((int16_t)((uint16_t)(h - ax)) < 0) ? ax : h;
     }
+}
+
+/* Accelerator bookkeeping for one insert (bp -> bucket slot, link ax). */
+static inline void lz12_fast_insert(LZ12State *lz, uint16_t bp, uint16_t slot,
+                                    uint16_t link, int real_link)
+{
+    struct M12FastIdx *fx = lz->fx;
+    uint32_t X = lz->ins_abs++;
+    /* A link is continuous only if it points at the true last node of the
+     * bucket (not a sweep / init sentinel, not a terminator). */
+    uint32_t last = fx->habs[slot];
+    int cont = real_link && last != 0u && (uint16_t)last == link;
+    uint32_t c = fx->bcnt[slot] + (cont ? 1u : M12F_GAP);
+    fx->bcnt[slot] = c;
+    fx->habs[slot] = X;
+    M12FNode *nd = &fx->node[bp];
+    nd->cnt = c;
+
+    /* Physical position of this node: phys = abs_bp - 0x100.  Nodes outside
+     * [0, size) can never be compared (legacy skips/never reaches them). */
+    uint32_t pb = X - M12F_BASE;
+    if (pb < 0x100u || (size_t)(pb - 0x100u) >= lz->src_size) {
+        nd->kn = KN_NONE;
+        return;
+    }
+    const uint8_t *q = lz->src + (pb - 0x100u);
+    uint32_t key  = (uint32_t)q[0] | ((uint32_t)q[1] << 8); /* zero-padded src */
+    uint32_t pair = ((uint32_t)slot << 16) | key;           /* 28 bits */
+    uint32_t si   = (pair * 0x9E3779B1u) >> (32 - M12F_SETS_LOG);
+    uint32_t tag  = pair | 0x80000000u;                     /* never 0 (= empty) */
+    M12FSet *st = &fx->set[si];
+    int victim;
+#if defined(__SSE2__) && M12F_WAYS == 8
+    __m128i T  = _mm_set1_epi32((int)tag);
+    int hm = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                 _mm_loadu_si128((const __m128i *)&st->pair[0]), T)))
+           | _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                 _mm_loadu_si128((const __m128i *)&st->pair[4]), T))) << 4;
+    if (hm) {
+        int w = __builtin_ctz((unsigned)hm);
+        nd->kn = st->abs[w];             /* most recent node with this pair */
+        st->abs[w] = X;
+        return;
+    }
+    /* Free way = empty or expired (age >= 0x8000; ages stay < 2^31). */
+    __m128i Xv  = _mm_set1_epi32((int)X);
+    __m128i lim = _mm_set1_epi32(0x7FFF);
+    int em = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(_mm_sub_epi32(Xv,
+                 _mm_loadu_si128((const __m128i *)&st->abs[0])), lim)))
+           | _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(_mm_sub_epi32(Xv,
+                 _mm_loadu_si128((const __m128i *)&st->abs[4])), lim))) << 4;
+    nd->kn = (X - fx->evict[si] < 0x8000u) ? KN_UNKNOWN : KN_NONE;
+    if (em) {
+        victim = __builtin_ctz((unsigned)em);
+    } else {
+        victim = 0;                      /* all live: evict the oldest */
+        for (int w = 1; w < M12F_WAYS; w++)
+            if (X - st->abs[w] > X - st->abs[victim]) victim = w;
+        uint32_t ev = st->abs[victim];
+        if ((int32_t)(ev - fx->evict[si]) > 0) fx->evict[si] = ev;
+    }
+#else
+    victim = 0;
+    uint32_t vage = 0;
+    for (int w = 0; w < M12F_WAYS; w++) {
+        if (st->pair[w] == tag) {
+            nd->kn = st->abs[w];         /* most recent node with this pair */
+            st->abs[w] = X;
+            return;
+        }
+        uint32_t age = X - st->abs[w];
+        if (age > vage) { vage = age; victim = w; }
+    }
+    /* Not present: either no such node in the window, or it was evicted. */
+    nd->kn = (X - fx->evict[si] < 0x8000u) ? KN_UNKNOWN : KN_NONE;
+    if (vage < 0x8000u) {                /* evicting a live entry */
+        uint32_t ev = st->abs[victim];
+        if ((int32_t)(ev - fx->evict[si]) > 0) fx->evict[si] = ev;
+    }
+#endif
+    st->abs[victim]  = X;
+    st->pair[victim] = tag;
 }
 
 /* Hash-insert only (no match search) — used to fast-forward bp during pre-scan.
@@ -1427,8 +1665,13 @@ static void lz12_insert(LZ12State *lz, uint16_t bp)
      * [C400] stores the slot BYTE-OFFSET (= slot_index * 2).
      * bx = [C400];  bx <<= 3;  bl += buf[bp+2];  bh &= 0x0F;  bx *= 2.
      * The shl-3 on the byte-offset gives an effective *16 multiplier on the slot index.
-     * byte2 = DS:[bp+2] (raw, wraps as uint16_t) = file[bp+2] if in range. */
-    uint8_t  byte2 = lz12_raw(lz, (uint16_t)(bp + 2u));
+     *
+     * In DOS real-mode, [bp+di+2] is read from the sliding buffer where di is
+     * updated on refill (call 0xd234), so it always reads the next sequential byte
+     * of the input file.
+     * Sequential ins_pos reads the real file bytes, matching historical DOS AIN.EXE. */
+    uint8_t  byte2 = (lz->ins_pos < lz->src_size) ? lz->src[lz->ins_pos] : 0u;
+    lz->ins_pos++;
     uint16_t bx    = lz->bx_slot;                   /* doubled slot (byte offset) */
     bx = (uint16_t)(bx << 3);                       /* shl bx, 3 */
     uint8_t  bl    = (uint8_t)bx + byte2;           /* add bl,[bp+di+2]  — 8-bit, no carry */
@@ -1441,9 +1684,13 @@ static void lz12_insert(LZ12State *lz, uint16_t bp)
     lz->hash[slot_idx] = bp;
     lz->bx_slot    = bx;                             /* [C400] = new byte-offset */
     /* CEA4–CEA6: chain[bp] = old_head (or NIL if old_head is "newer" than bp) */
-    if ((int16_t)((uint16_t)(bp - ax)) < 0)
+    int real_link = 1;
+    if ((int16_t)((uint16_t)(bp - ax)) < 0) {
         ax = (uint16_t)(bp - 0x8000u);
+        real_link = 0;
+    }
     lz->chain[bp & (M12_CHAIN_SIZE - 1u)] = ax;
+    if (lz->fast) lz12_fast_insert(lz, bp, slot_idx, ax, real_link);
 }
 
 /* DOS M1/M2 match search — D318 path (normal) or D420 path (D2C0 offset walk).
@@ -1474,12 +1721,9 @@ static void lz12_insert(LZ12State *lz, uint16_t bp)
  *
  * Uses word-by-word comparison matching the DOS repe cmpsw, max 256 bytes.
  */
-static void lz12_extend(LZ12State *lz,
-                         size_t phys_cand,   /* physical candidate start */
-                         size_t pos_emit,    /* physical pos_emit */
-                         uint16_t bx_pos,   /* raw DOS addr stored as cur_pos */
-                         int *best,
-                         int d420)           /* 0=D360 (from offset 0), 1=D468 (from offset 2) */
+/* Pure part of D360/D468: match length for a candidate (no state change). */
+static inline int lz12_extend_len(const LZ12State *lz, size_t phys_cand,
+                                  size_t pos_emit, int d420)
 {
     size_t sz   = lz->src_size;
     int    from = d420 ? 2 : 0;             /* byte offset to start comparing */
@@ -1490,18 +1734,15 @@ static void lz12_extend(LZ12State *lz,
     int avail   = (avail_c < avail_p) ? avail_c : avail_p;
     if (avail > 256) avail = 256;
 
-    if (d420 && avail < 1) return; /* need at least byte 0 (already confirmed) */
+    if (d420 && avail < 1) return 0; /* need at least byte 0 (already confirmed) */
 
     /* D420 path: DOS skips byte 1 (structural invariant in archive output).
      * For our compressor to produce correct round-trips, we must verify byte 1 too.
      * If byte 1 doesn't match, the match length stays at 1 (below MIN_MATCH=3),
-     * so the match is rejected. We achieve this by starting extension at byte 1
-     * instead of byte 2, giving from=1, max_words=0x7F+1=128. */
+     * so the match is rejected. */
     if (d420) {
-        /* Verify byte 1 (offset 1 from match start = pc+1 vs pos_emit+1) */
-        if (avail < 2) return;
-        if (lz->src[phys_cand + 1] != lz->src[pos_emit + 1]) return; /* byte 1 mismatch → no match */
-        /* byte 1 matched: proceed with extension from byte 2 (same as DOS) */
+        if (avail < 2) return 0;
+        if (lz->src[phys_cand + 1] != lz->src[pos_emit + 1]) return 0;
     }
 
     /* Extension: byte LCP from 'from', up to max_words pairs.
@@ -1513,14 +1754,18 @@ static void lz12_extend(LZ12State *lz,
         len += ain_lcp(lz->src + phys_cand + from,
                        lz->src + pos_emit + from,
                        max_ext - from);
+    /* d420: len = 2N+2 or 2N+3 == DOS cx (D487); d360: total bytes from 0. */
+    return len;
+}
 
-    /* For d420: len = stopping position from offset 0 (starts at 2, counts from there).
-     * DOS formula (D487): cx = 1 + 2N - CF = total match length including byte 0.
-     * When extension starts at offset 2 and N pairs match: len = 2 + 2N (or 2+2N+1 via CF).
-     * That gives len = 2N+2 or 2N+3; DOS cx = 2N+2 or 2N+3 → match_len = len. ✓
-     * For d360: len = total bytes from offset 0. match_len = len. ✓ */
-    int match_len = len;  /* same formula for both d420 and d360 */
-
+static void lz12_extend(LZ12State *lz,
+                         size_t phys_cand,   /* physical candidate start */
+                         size_t pos_emit,    /* physical pos_emit */
+                         uint16_t bx_pos,   /* raw DOS addr stored as cur_pos */
+                         int *best,
+                         int d420)           /* 0=D360 (from offset 0), 1=D468 (from offset 2) */
+{
+    int match_len = lz12_extend_len(lz, phys_cand, pos_emit, d420);
     if (match_len >= 3 && match_len > *best) {
         *best = match_len;
         lz->cur_len = (uint16_t)match_len;
@@ -1543,69 +1788,68 @@ static void lz12_extend(LZ12State *lz,
  * D4BD uses si_work = 2*(ax_saved + cx_DOS) where cx_DOS = cx_match - 1,
  *   then shr→sub→add restores si to ax_saved = cx_d2c0. So D4D6 always resets si.
  */
+/* D420/D427/D435 candidate test (one hop), exactly as the DOS compare:
+ * word compare when both words are inside the file, else low byte only. */
+static inline uint16_t ain_ld16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+/* Simplified form of the DOS test, exact because si <= 0 on every D420 path
+ * (cx from D2C0, 2-best, 3-best with best >= 3): for a valid candidate
+ * cand_s = pos_emit - dist + si <= pos_emit - 1, so cand_s + 1 < sz always
+ * holds and only cand_s >= 0 (dist <= pos_emit + si) and the "last byte"
+ * case (pos_emit + 1 == sz: low-byte compare) remain. */
+static inline int lz12_d420_hit(const LZ12State *lz, size_t pos_emit, uint16_t dist,
+                                int16_t si, uint16_t ax_word)
+{
+#ifdef AIN_VERIFY_FASTPATH
+    if (si > 0) abort();
+#endif
+    if ((uint16_t)(dist - 1u) >= 0x7FFFu) return 0;       /* dist in [1, 0x7FFF] */
+    ptrdiff_t cand_s = (ptrdiff_t)pos_emit + (ptrdiff_t)si - (ptrdiff_t)dist;
+    if (cand_s < 0) return 0;
+    const uint8_t *c = lz->src + cand_s;
+    if (pos_emit + 1 < lz->src_size) return ain_ld16(c) == ax_word;
+    return c[0] == (uint8_t)ax_word;
+}
+
 static void lz12_d420(LZ12State *lz, uint16_t bp, size_t pos_emit,
-                      uint16_t bx0, int dx, uint16_t ax_word, int16_t cx_d2c0)
+                      uint16_t bx0, int dx, uint16_t ax_word, int16_t cx_d2c0,
+                      uint16_t anchor)
 {
     size_t   sz      = lz->src_size;
     uint16_t pos_raw = (uint16_t)(bp - 0x00FFu);
     int      best    = (int)lz->cur_len;
     uint16_t bx      = bx0;
     int16_t  si      = cx_d2c0;
+    /* Accelerator (see M12FastIdx): an improving D468 hit at node y means the
+     * match z = phys(y)+si covers offsets -si and -si+1, so y has the same
+     * (bucket, word-at-offset-0) pair as the walk's anchor node, whose
+     * chain[] successor is bx and whose word is the word at pos_emit - si.
+     * Non-improving hits only reset the 3-hop phase (D4E4).  Not usable when
+     * best >= 256 (then any hit returns at D44D). */
+    uint32_t bp_abs  = M12F_BASE + 0x100u + (uint32_t)pos_emit + 0xFFu;
+    if (lz->fast) goto fast_entry;
 
 d420_loop:
     for (;;) {
         /* Hop 1: 0000D420 dec dx; jl 0xd44c */
         dx--;
         if (dx < 0) return;
-
-        {
-            uint16_t dist = (uint16_t)(pos_raw - bx);
-            if (dist > 0u && dist <= 0x7FFFu) {
-                ptrdiff_t cand_s = (ptrdiff_t)(pos_emit - dist) + (ptrdiff_t)si;
-                if (cand_s >= 0 && (size_t)cand_s + 1 < sz && pos_emit + 1 < sz) {
-                    uint16_t cw = (uint16_t)lz->src[(size_t)cand_s] | ((uint16_t)lz->src[(size_t)cand_s + 1] << 8);
-                    if (cw == ax_word) goto d468;
-                } else if (cand_s >= 0 && (size_t)cand_s < sz && lz->src[(size_t)cand_s] == (uint8_t)ax_word) {
-                    goto d468;
-                }
-            }
-        }
+        if (lz12_d420_hit(lz, pos_emit, (uint16_t)(pos_raw - bx), si, ax_word)) goto d468;
 
         /* Hop 2: 0000D427 bx = chain[bx]; cmp bp, bx; js 0xd44c */
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
         if ((int16_t)((uint16_t)(bp - bx)) < 0) return;
         dx--;
-
-        {
-            uint16_t dist = (uint16_t)(pos_raw - bx);
-            if (dist > 0u && dist <= 0x7FFFu) {
-                ptrdiff_t cand_s = (ptrdiff_t)(pos_emit - dist) + (ptrdiff_t)si;
-                if (cand_s >= 0 && (size_t)cand_s + 1 < sz && pos_emit + 1 < sz) {
-                    uint16_t cw = (uint16_t)lz->src[(size_t)cand_s] | ((uint16_t)lz->src[(size_t)cand_s + 1] << 8);
-                    if (cw == ax_word) goto d468;
-                } else if (cand_s >= 0 && (size_t)cand_s < sz && lz->src[(size_t)cand_s] == (uint8_t)ax_word) {
-                    goto d468;
-                }
-            }
-        }
+        if (lz12_d420_hit(lz, pos_emit, (uint16_t)(pos_raw - bx), si, ax_word)) goto d468;
 
         /* Hop 3: 0000D435 bx = chain[bx]; cmp bp, bx; js 0xd44c */
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
         if ((int16_t)((uint16_t)(bp - bx)) < 0) return;
         dx--;
-
-        {
-            uint16_t dist = (uint16_t)(pos_raw - bx);
-            if (dist > 0u && dist <= 0x7FFFu) {
-                ptrdiff_t cand_s = (ptrdiff_t)(pos_emit - dist) + (ptrdiff_t)si;
-                if (cand_s >= 0 && (size_t)cand_s + 1 < sz && pos_emit + 1 < sz) {
-                    uint16_t cw = (uint16_t)lz->src[(size_t)cand_s] | ((uint16_t)lz->src[(size_t)cand_s + 1] << 8);
-                    if (cw == ax_word) goto d468;
-                } else if (cand_s >= 0 && (size_t)cand_s < sz && lz->src[(size_t)cand_s] == (uint8_t)ax_word) {
-                    goto d468;
-                }
-            }
-        }
+        if (lz12_d420_hit(lz, pos_emit, (uint16_t)(pos_raw - bx), si, ax_word)) goto d468;
 
         /* End of 3-hop block: 0000D443 bx = chain[bx]; cmp bp, bx; jns 0xd420; ret */
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
@@ -1641,6 +1885,8 @@ d468:
             bx  = ax_sec;
             si  = (int16_t)(2 - cx_match);
             ax_word = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
+            anchor = sec_slot;
+            if (lz->fast) goto fast_entry;
             goto d420_loop;
         }
 
@@ -1651,6 +1897,7 @@ d468:
 
         if ((int16_t)((uint16_t)(bp - ax_c)) < 0) return;
 
+        uint16_t bx_hit  = bx;
         uint16_t bx_next = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
         if ((int16_t)((uint16_t)(bp - bx_next)) < 0) return;
         bx = bx_next;
@@ -1659,19 +1906,84 @@ d468:
             bx  = ax_c;
             si  = (int16_t)(3 - cx_match);
             ax_word = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
+            anchor = sec2_slot;
+            if (lz->fast) goto fast_entry;
             goto d420_loop;
         }
 
         si  = ax_saved;
         ax_word = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
+        anchor = bx_hit;                 /* improving hit: same pair as the anchor */
+        if (lz->fast) goto fast_entry;
         goto d420_loop;
     }
 
 d4e4:
-    bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
-    if ((int16_t)((uint16_t)(bp - bx)) < 0) return;
-    ax_word = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
-    goto d420_loop;
+    {
+        uint16_t bx_hit = bx;
+        bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
+        if ((int16_t)((uint16_t)(bp - bx)) < 0) return;
+        ax_word = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
+        if (lz->fast) {
+            /* Continue on the pair only if the hit node belongs to it. */
+            size_t hp = pos_emit - (size_t)(uint16_t)(pos_raw - bx_hit);
+            size_t ap = (size_t)((ptrdiff_t)pos_emit - (ptrdiff_t)si);
+            if (hp < sz && ap < sz &&
+                lz->src[hp] == lz->src[ap] && lz->src[hp + 1] == lz->src[ap + 1]) {
+                anchor = bx_hit;
+                goto fast_entry;
+            }
+        }
+        goto d420_loop;
+    }
+
+fast_entry:
+    /* Invariant: bx == chain[anchor] (js-checked); anchor's word == word at
+     * pos_emit - si.  Visit only nodes of that pair; replay dx exactly. */
+    {
+        if (best >= 256) goto d420_loop;
+        const struct M12FastIdx *fx = lz->fx;
+        uint32_t ca = fx->node[anchor].cnt;
+        uint32_t y  = fx->node[anchor].kn;
+        int D = dx;
+        for (;;) {
+            if (y == KN_UNKNOWN) goto d420_loop;          /* exact fallback */
+            if (bp_abs - y >= 0x8000u) return;            /* js exit first (or none) */
+            const M12FNode *ny = &fx->node[(uint16_t)y];
+            uint32_t k = ca - ny->cnt;                    /* 1-based hop index */
+            if ((int64_t)k > (int64_t)D) {
+                if ((int64_t)k >= (int64_t)D + 3) return;
+                goto d420_loop;                           /* phase-dependent: replay */
+            }
+            uint16_t dist = (uint16_t)(pos_raw - (uint16_t)y);
+            if (lz12_d420_hit(lz, pos_emit, dist, si, ax_word)) {
+                ptrdiff_t pc_s = (ptrdiff_t)(pos_emit - dist) + (ptrdiff_t)si;
+                if (pc_s >= 0) {
+                    int ml = lz12_extend_len(lz, (size_t)pc_s, pos_emit, 1);
+                    if (ml >= 3 && ml > best) {
+                        dx = D - (int)k;
+                        bx = (uint16_t)y;
+                        goto d468;
+                    }
+                }
+            }
+            y = ny->kn;
+        }
+    }
+}
+
+/* D330/D337/D345 candidate test.  The DOS form is
+ *   phys_cand = pos_emit - dist (may wrap);  if (phys_cand + si < sz)
+ *   compare word (or low byte at EOF) at phys_cand + si with ax_word.
+ * Because pos_emit + si < sz (si = best-1, best <= sz - pos_emit) and the
+ * buffer is zero-padded, this is exactly: dist in [1, 0x7FFF],
+ * dist <= pos_emit + si, and the padded word at pos_emit + si - dist equals
+ * ax_word (= padded word at pos_emit + si). */
+static inline int lz12_d318_hit(const uint8_t *tp, size_t lim_si, uint16_t dist,
+                                uint16_t ax_word)
+{
+    return (uint16_t)(dist - 1u) < 0x7FFFu && dist <= lim_si + 256u &&
+           ain_ld16(tp - dist) == ax_word;
 }
 
 /* D318 chain walk: normal search from chain[bp-0xFF], compare at offset si=0.
@@ -1696,26 +2008,33 @@ static void lz12_d318_dx(LZ12State *lz, uint16_t bp, size_t pos_emit, int *pdx, 
         ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit + 1] << 8)) :
         lz->src[pos_emit];
 
+    size_t lim_si;
+    const uint8_t *tp;
+    /* Accelerator: abs of the current bp (pos_raw node has phys == pos_emit). */
+    const uint16_t key0 = ax_word;   /* word at pos_emit: the key of pos_raw's pair */
+    uint32_t bp_abs = 0;
+    uint16_t fp = pos_raw;        /* pair node whose chain[] successor is bx */
+    if (lz->fast) {
+        bp_abs = M12F_BASE + 0x100u + (uint32_t)pos_emit + 0xFFu;
+        /* The D2C0 entry (bx_start) only happens with cx == 0, i.e. the
+         * scanned slot is pos_raw itself: bx_start == chain[pos_raw] too. */
+#ifdef AIN_VERIFY_FASTPATH
+        if (bx_start && bx_start != lz->chain[pos_raw]) abort();
+#endif
+        goto fast_jump;
+    }
+
 d330_entry:
+    /* Word at pos_emit+si (zero-padded) and the bound dist <= pos_emit+si:
+     * see lz12_d318_hit. */
+    lim_si = pos_emit + (size_t)si;
+    tp     = lz->src + lim_si;
     for (;;) {
         /* Hop 1: 0000D330 dec dx; jl 0xd3a8 */
         (*pdx_use)--;
         if (*pdx_use < 0) return;
 
-        {
-            uint16_t dist = (uint16_t)(pos_raw - bx);
-            if (dist > 0u && dist <= 0x7FFFu) {
-                size_t phys_cand = pos_emit - (size_t)dist;
-                if (phys_cand + (size_t)si < sz) {
-                    uint16_t cand_w = (phys_cand + (size_t)si + 1 < sz) ?
-                        ((uint16_t)lz->src[phys_cand + si] | ((uint16_t)lz->src[phys_cand + si + 1] << 8)) :
-                        lz->src[phys_cand + si];
-                    if (cand_w == ax_word) {
-                        goto d360;
-                    }
-                }
-            }
-        }
+        if (lz12_d318_hit(tp, lim_si, (uint16_t)(pos_raw - bx), ax_word)) goto d360;
 
         /* Hop 2: 0000D337 bx = chain[bx]; cmp bp, bx; js 0xd3a8 */
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
@@ -1723,20 +2042,7 @@ d330_entry:
         (*pdx_use)--;
         /* Note: DOS does NOT test jl 0xd3a8 here! */
 
-        {
-            uint16_t dist = (uint16_t)(pos_raw - bx);
-            if (dist > 0u && dist <= 0x7FFFu) {
-                size_t phys_cand = pos_emit - (size_t)dist;
-                if (phys_cand + (size_t)si < sz) {
-                    uint16_t cand_w = (phys_cand + (size_t)si + 1 < sz) ?
-                        ((uint16_t)lz->src[phys_cand + si] | ((uint16_t)lz->src[phys_cand + si + 1] << 8)) :
-                        lz->src[phys_cand + si];
-                    if (cand_w == ax_word) {
-                        goto d360;
-                    }
-                }
-            }
-        }
+        if (lz12_d318_hit(tp, lim_si, (uint16_t)(pos_raw - bx), ax_word)) goto d360;
 
         /* Hop 3: 0000D345 bx = chain[bx]; cmp bp, bx; js 0xd3a8 */
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
@@ -1744,20 +2050,7 @@ d330_entry:
         (*pdx_use)--;
         /* Note: DOS does NOT test jl 0xd3a8 here! */
 
-        {
-            uint16_t dist = (uint16_t)(pos_raw - bx);
-            if (dist > 0u && dist <= 0x7FFFu) {
-                size_t phys_cand = pos_emit - (size_t)dist;
-                if (phys_cand + (size_t)si < sz) {
-                    uint16_t cand_w = (phys_cand + (size_t)si + 1 < sz) ?
-                        ((uint16_t)lz->src[phys_cand + si] | ((uint16_t)lz->src[phys_cand + si + 1] << 8)) :
-                        lz->src[phys_cand + si];
-                    if (cand_w == ax_word) {
-                        goto d360;
-                    }
-                }
-            }
-        }
+        if (lz12_d318_hit(tp, lim_si, (uint16_t)(pos_raw - bx), ax_word)) goto d360;
 
         /* End of 3-hop block: 0000D353 bx = chain[bx]; cmp bp, bx; jns 0xd330; jmp 0xd3a8 */
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
@@ -1766,13 +2059,12 @@ d330_entry:
 
 d360:
     {
-        size_t cand_phys = pos_emit - (size_t)(uint16_t)(pos_raw - bx);
+        uint16_t dist = (uint16_t)(pos_raw - bx);
+        size_t cand_phys = (dist <= pos_emit) ? (pos_emit - dist) : (size_t)-1;
         int lim = 256;
-        if (cand_phys >= sz) lim = 0;
-        else if (sz - cand_phys < (size_t)lim) lim = (int)(sz - cand_phys);
         if (pos_emit >= sz) lim = 0;
         else if (sz - pos_emit < (size_t)lim) lim = (int)(sz - pos_emit);
-        int cand_len = (lim > 0) ? ain_lcp(lz->src + cand_phys, lz->src + pos_emit, lim) : 0;
+        int cand_len = (lim > 0) ? ain_lcp(lz->src + pos_emit - dist, lz->src + pos_emit, lim) : 0;
         if (cand_len >= 256) {
             lz->cur_len = 256;
             lz->cur_pos = bx;
@@ -1794,7 +2086,7 @@ d360:
                 /* D3E6: js D40C with ax=2: si = -(best - 2) = 2 - best */
                 int16_t si_d420 = (int16_t)(2 - best);
                 uint16_t aw = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
-                lz12_d420(lz, bp, pos_emit, cx, *pdx_use, aw, si_d420);
+                lz12_d420(lz, bp, pos_emit, cx, *pdx_use, aw, si_d420, end_slot);
                 return;
             }
 
@@ -1810,7 +2102,7 @@ d360:
                 /* D3FC: js D40C with ax=3: si = -(best - 3) = 3 - best */
                 int16_t si_d420 = (int16_t)(3 - best);
                 uint16_t aw = (pos_emit + 1 < sz) ? ((uint16_t)lz->src[pos_emit] | ((uint16_t)lz->src[pos_emit+1] << 8)) : lz->src[pos_emit];
-                lz12_d420(lz, bp, pos_emit, cx, *pdx_use, aw, si_d420);
+                lz12_d420(lz, bp, pos_emit, cx, *pdx_use, aw, si_d420, end_slot2);
                 return;
             }
 
@@ -1819,17 +2111,71 @@ d360:
             ax_word = (pos_emit + (size_t)si + 1 < sz) ?
                 ((uint16_t)lz->src[pos_emit + si] | ((uint16_t)lz->src[pos_emit + si + 1] << 8)) :
                 lz->src[pos_emit + si];
+            fp = bx;                 /* improving node: same pair as pos_raw */
             bx = step_bx;
+            if (lz->fast) goto fast_jump;
             goto d330_entry;
         }
 
         /* D394: cand_len did NOT beat best */
+        fp = bx;
         bx = lz->chain[bx & (M12_CHAIN_SIZE - 1u)];
         if ((int16_t)((uint16_t)(bp - bx)) < 0) return;
         ax_word = (pos_emit + (size_t)si + 1 < sz) ?
             ((uint16_t)lz->src[pos_emit + si] | ((uint16_t)lz->src[pos_emit + si + 1] << 8)) :
             lz->src[pos_emit + si];
+        /* Fast path only from a node of the same pair (word at offset 0 == T0):
+         * always true for si == 0, a cheap check otherwise (false filter hits). */
+        if (lz->fast && (si == 0 ||
+            (cand_phys < sz && ((uint16_t)lz->src[cand_phys] | ((uint16_t)lz->src[cand_phys + 1] << 8)) == key0)))
+            goto fast_jump;
         goto d330_entry;
+    }
+
+fast_jump:
+    /* Invariant: bx == chain[fp] (already js-checked), fp is a node of the walked
+     * bucket whose word at offset 0 equals key0 (the "pair" of pos_raw).
+     *
+     * si == 0: every node of the pair is a hit (D360), nothing else is, and no
+     *   phase reset happens before it, so the hop-1 dx test is replayed exactly.
+     * si  > 0: only pair nodes can *improve* (LCP >= best+1 implies the first
+     *   word matches).  Other filter hits are non-improving and only reset the
+     *   3-hop phase; that cannot change reachability unless the improving node
+     *   sits at index D+1 or D+2 — then the legacy loop replays this entry. */
+    {
+        const struct M12FastIdx *fx = lz->fx;
+        uint32_t cfp = fx->node[fp].cnt;
+        uint32_t y   = fx->node[fp].kn;
+        int D = *pdx_use;
+        for (;;) {
+            if (y == KN_UNKNOWN) goto d330_entry;         /* exact fallback */
+            if (bp_abs - y >= 0x8000u) return;            /* js exit first (or none) */
+            const M12FNode *ny = &fx->node[(uint16_t)y];
+            uint32_t k = cfp - ny->cnt;                   /* 1-based hop index */
+            if (si == 0) {
+                if (k > 0x7FFFu || (int)(3u * ((k - 1u) / 3u) + 1u) > D) return;
+            } else {
+                if ((int64_t)k > (int64_t)D) {
+                    if ((int64_t)k >= (int64_t)D + 3) return;
+                    goto d330_entry;                      /* phase-dependent: replay */
+                }
+                /* Would this node improve?  Same filter + LCP as D330/D360. */
+                size_t yp = (size_t)(y - M12F_BASE - 0x100u);
+                const uint8_t *yq = lz->src + yp;
+                if (((uint16_t)yq[si] | ((uint16_t)yq[si + 1] << 8)) != ax_word) {
+                    y = ny->kn; continue;
+                }
+                int lim = 256;
+                if (sz - yp < (size_t)lim) lim = (int)(sz - yp);
+                if (sz - pos_emit < (size_t)lim) lim = (int)(sz - pos_emit);
+                if (ain_lcp(yq, lz->src + pos_emit, lim) <= best) {
+                    y = ny->kn; continue;
+                }
+            }
+            *pdx_use = D - (int)k;
+            bx = (uint16_t)y;
+            goto d360;
+        }
     }
 }
 
@@ -1930,7 +2276,9 @@ static void lz12_d2c0(LZ12State *lz, uint16_t bp, size_t pos_emit, uint16_t prv_
         lz12_d318_dx(lz, bp, pos_emit, &dx, bx_entry);
     } else {
         /* D315: jmp D420 — enter D420 with bx = bx_entry */
-        lz12_d420(lz, bp, pos_emit, bx_entry, dx_chain, ax_word, cx);
+        /* bx_entry == chain[pos_raw - cx] (D2C5–D301 scan) */
+        lz12_d420(lz, bp, pos_emit, bx_entry, dx_chain, ax_word, cx,
+                  (uint16_t)((uint16_t)(bp - 0x00FFu) - (uint16_t)cx));
     }
 }
 
@@ -1943,6 +2291,35 @@ static void lz12_search(LZ12State *lz, uint16_t bp, size_t pos_emit)
     else
         lz12_d318(lz, bp, pos_emit);
 }
+
+#ifdef AIN_VERIFY_FASTPATH
+/* Self-check build: every search runs twice, legacy walk then accelerated,
+ * and must produce the same (cur_len, cur_pos).  The search only writes
+ * those two fields, so this is a complete equivalence check per call. */
+static unsigned long long g_verify_calls;
+static void lz12_verified(LZ12State *lz, void (*fn)(LZ12State *, uint16_t, size_t),
+                          uint16_t bp, size_t pos_emit)
+{
+    uint16_t l0 = lz->cur_len, p0 = lz->cur_pos;
+    int f = lz->fast;
+    lz->fast = 0;
+    fn(lz, bp, pos_emit);
+    uint16_t l1 = lz->cur_len, p1 = lz->cur_pos;
+    lz->cur_len = l0; lz->cur_pos = p0; lz->fast = f;
+    fn(lz, bp, pos_emit);
+    if (lz->cur_len != l1 || lz->cur_pos != p1) {
+        fprintf(stderr, "FASTPATH MISMATCH at pos_emit=%zu bp=%04x: legacy (%u,%04x) fast (%u,%04x)\n",
+                pos_emit, bp, l1, p1, lz->cur_len, lz->cur_pos);
+        abort();
+    }
+    g_verify_calls++;
+}
+#define LZ12_SEARCH(lz, bp, pe) lz12_verified((lz), lz12_search, (bp), (pe))
+#define LZ12_D318(lz, bp, pe)   lz12_verified((lz), lz12_d318, (bp), (pe))
+#else
+#define LZ12_SEARCH(lz, bp, pe) lz12_search((lz), (bp), (pe))
+#define LZ12_D318(lz, bp, pe)   lz12_d318((lz), (bp), (pe))
+#endif
 
 /* One iteration of the M1/M2 main loop (CE82–CF35):
  *   1. Insert bp into hash (CE82–CEA6).
@@ -1974,7 +2351,7 @@ static void lz12_step(LZ12State *lz, uint16_t bp, size_t pos_emit)
     }
 
     /* CEB5: D2C0 / D318 — find new best match */
-    lz12_search(lz, bp, pos_emit);
+    LZ12_SEARCH(lz, bp, pos_emit);
 }
 
 /* ======================================================================
@@ -2005,13 +2382,13 @@ typedef struct {
  *     find D s.t. (1<<(D-1)) < actual_dist <= (1<<D)
  *     extra = actual_dist - (1<<(D-1)) - 1, ebits = D-1
  * ==================================================================== */
-static void dist_to_D(int token_dist, int *D_out, uint16_t *extra_out, int *ebits_out)
+static inline void dist_to_D(int token_dist, int *D_out, uint16_t *extra_out, int *ebits_out)
 {
     int dist = token_dist + 1;   /* convert 0-based back to 1-based */
     if (dist == 1) { *D_out=0; *extra_out=0; *ebits_out=0; return; }
     if (dist == 2) { *D_out=1; *extra_out=0; *ebits_out=0; return; }
-    int D = 2;
-    while ((1 << D) < dist) D++;
+    /* smallest D >= 2 with (1 << D) >= dist  (dist >= 3) */
+    int D = 32 - __builtin_clz((unsigned)(dist - 1));
     *D_out     = D;
     *extra_out = (uint16_t)(dist - (1 << (D-1)) - 1);
     *ebits_out = D - 1;
@@ -2111,8 +2488,11 @@ static void write_block(BW *bw,
             int D; uint16_t extra; int ebits;
             dist_to_D(tokens[i].dist, &D, &extra, &ebits);
 
-            bw_write(bw, sym_code[256 + D], sym_clen[256 + D]);
-            if (ebits) bw_write(bw, extra, ebits);
+            /* class code + extra bits in one write (<= 16 + 14 bits) */
+            int l1 = sym_clen[256 + D];
+            uint32_t v = ((uint32_t)sym_code[256 + D] & ((1u << l1) - 1u))
+                       | ((uint32_t)extra << l1);
+            bw_write(bw, v, l1 + ebits);
 
             int lsym = (int)tokens[i].length - 3;
             if (lsym < 0) lsym = 0;
@@ -2141,15 +2521,24 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
     /* Session bit (always 0) */
     bw_write(bw, 0u, 1);
 
-    /* Zero-pad past EOF so match-extend can peek words without bounds checks.
-     * Length stays `size`; pad bytes are never emitted as literals. */
+    /* Zero-pad before (256 bytes) and past EOF (MAX_MATCH+4) so match-extend
+     * can peek words without bounds checks and match against leading zeros
+     * (mirrors DOS BSS buffer layout where DS:0x0000..0x00FF is zeroed). */
+    #define PAD_PREFIX 256
     uint8_t *padded = NULL;
     if (size > 0) {
-        padded = malloc(size + MAX_MATCH + 4);
-        if (!padded) return;
-        memcpy(padded, data, size);
-        memset(padded + size, 0, MAX_MATCH + 4);
-        data = padded;
+        size_t needed = PAD_PREFIX + size + MAX_MATCH + 4;
+        if (g_enc.pad_cap < needed) {
+            free(g_enc.pad);
+            g_enc.pad_cap = needed;
+            g_enc.pad = malloc(g_enc.pad_cap);
+            if (!g_enc.pad) { g_enc.pad_cap = 0; return; }
+        }
+        padded = g_enc.pad;
+        memset(padded, 0, PAD_PREFIX);
+        memcpy(padded + PAD_PREFIX, data, size);
+        memset(padded + PAD_PREFIX + size, 0, MAX_MATCH + 4);
+        data = padded + PAD_PREFIX;
     }
 
     if (size == 0) {
@@ -2180,7 +2569,8 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
      * M3: intermediate buffer threshold fires before TOKEN_STACK_LIMIT, so we only
      * need a buffer sized to one block's worth of tokens (~14000 max for all-literals).
      * M1/M2: TOKEN_STACK_LIMIT is the DOS stack depth limit; BLOCK_OUTPUT_LIMIT fires first. */
-    Token *tokens = malloc((TOKEN_STACK_LIMIT + 4) * sizeof(Token));
+    if (!g_enc.tokens) g_enc.tokens = malloc((TOKEN_STACK_LIMIT + 4) * sizeof(Token));
+    Token *tokens = g_enc.tokens;
 
     if (method == 3) {
         /* ---- M3: 4-gram hash chain (D0A0–D230) ---- */
@@ -2190,7 +2580,8 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
          * byte per 8 tokens.  When the buffer size = ceil(N/8) + L + 3*M >= 14960,
          * DOS calls D659 to flush the block (write Huffman header + encoded tokens).
          * We replicate this split trigger exactly. */
-        LZState *lz = malloc(sizeof(LZState));
+        if (!g_enc.lz3) g_enc.lz3 = malloc(sizeof(LZState));
+        LZState *lz = g_enc.lz3;
         lz_init(lz, data, size);
 
         uint16_t bp  = 0;
@@ -2247,7 +2638,6 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
         }
         /* Flush final block (D659 called at session end, no inter check needed) */
         write_block(bw, tokens, ntok, 1 /* last */);
-        free(lz);
 
     } else {
         /* ---- M1/M2: rolling 1-byte hash + chain walk (CE67–CF35 + D2C0–D51C) ----
@@ -2260,8 +2650,14 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
          * The first 3 positions (bp=0xFD,0xFE,0xFF) are pre-inserted in the init
          * loop (CE61–CE64). We start collecting output tokens from bp=0x100 onwards.
          */
-        LZ12State *lz12 = malloc(sizeof(LZ12State));
+        if (!g_enc.lz12) g_enc.lz12 = malloc(sizeof(LZ12State));
+        LZ12State *lz12 = g_enc.lz12;
         lz12_init(lz12, data, size, method);
+        /* CF1F: initial D318 search at bp=0x01FF for pos_emit=0 (mirrors DOS CF1F) */
+        int saved_fast = lz12->fast;
+        lz12->fast = 0;
+        LZ12_D318(lz12, 0x01FFu, 0);
+        lz12->fast = saved_fast;
 
         /* bp starts at 0x100; output position pos = bp - 0x100.
          * DEFERRED OUTPUT: we decide at each bp using PREVIOUS best (prv_len/prv_pos).
@@ -2357,7 +2753,7 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
                 }
                 /* CF1F: D318 at bp_last = bp - 1. */
                 lz12->cur_len = 0; lz12->cur_pos = 0;
-                lz12_d318(lz12, (uint16_t)(bp - 1u), pos);
+                LZ12_D318(lz12, (uint16_t)(bp - 1u), pos);
                 lz12->prv_len = 0; lz12->prv_pos = 0;
             } else {
                 /* Emit literal buf[bp - 0x100 - 1] = data[pos]
@@ -2377,11 +2773,7 @@ static void compress_session(BW *bw, const uint8_t *data, size_t size, int metho
         }
         /* Flush final block (D659 called at session end) */
         write_block(bw, tokens, ntok, 1 /* last */);
-        free(lz12);
     }
-
-    free(tokens);
-    free(padded);
 }
 
 /* ======================================================================
@@ -4258,5 +4650,6 @@ int main(int argc, char *argv[])
     }
 
     free(file_args);
+    enc_cache_free();
     return ret;
 }

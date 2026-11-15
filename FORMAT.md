@@ -188,6 +188,19 @@ When a symbol in `[256 .. 271]` is encountered in the main table, it defines a d
 
 ---
 
+### 3.6 Single-Symbol Tree Construction Quirk (DA12–DA19)
+
+A canonical binary Huffman tree strictly requires at least two leaf nodes to form a valid prefix code. When an encoder block contains only a single distinct symbol (for example, in blocks where all matches have $\text{dist} = 1$, only distance symbol `0` is emitted):
+
+- In standard Huffman implementations, a 1-symbol tree might trivially assign code length 1 to that symbol and leave all others with length 0, producing a high trailing-zero count ($nm$).
+- In DOS `AIN_UNP.EXE` (`0xDA12–0xDA19`), when active symbols count $n < 2$, the tree builder forcibly selects the **last two entries** of the sorted symbol table:
+  1. The single active symbol (e.g. Symbol `0`).
+  2. The last entry among the zero-frequency symbols (determined by ascending symbol index tie-breaking, which yields Symbol `253` for the 254-symbol distance table).
+- Both symbols are assigned code length 1 ($\text{lengths}[0] = 1, \text{lengths}[253] = 1$).
+- Consequently, the distance table spans up to index 253, setting $nm = 0$ (no trailing-zero truncation) rather than $nm = 253$. Replicating this behavior is strictly required for 100% bit-exact archive generation.
+
+---
+
 ## 4. LZ77 Engine & Sliding Window
 
 ### 4.1 Window Geometry & Overrun Buffer
@@ -262,6 +275,20 @@ uint16_t lz12_hash_step(uint16_t prev_bx_slot, uint8_t byte2) {
     return bx;                                      /* slot index = bx >> 1 */
 }
 ```
+
+#### 4.4.1 Pre-scan Loop & Initial Position 0 Match Search (CF1F)
+
+Before encoding the first token of a file, DOS `AIN_UNP.EXE` primes its rolling hash through an initial pre-scan sequence:
+1. **Pre-scan Loop (`0xCE61–0xCF19`)**: Inserts 258 sequential positions (`bp = 0x00FE .. 0x01FF`) into the hash table without match searching.
+2. **Initial Search at `CF1F` (`0xCF1B–0xCF1F`)**: Immediately upon completing the pre-scan, DOS executes `call 0xd318` with `bp = 0x01FF` to search for matches covering `bp - 0xFF = 0x100` (which is physical file position 0). The found match length and position are saved into `cur_len` and `cur_pos`.
+3. **Pre-file Zero History Buffer**: In DOS real-mode, the file buffer is loaded at `DS:0x0100`, while the preceding 256 bytes (`DS:0x0000 .. DS:0x00FF`) are zeroed out at initialization (`0xCD25`). If a file begins with zero bytes, the `CF1F` search matches backward into this pre-file zero padding, finding a run-length match with distance 1 right at position 0 (`M len dist=1`).
+4. **Main Loop Entry (`0xCE7C`)**: The main loop starts at `bp = 0x0200` (`pos = 0`), promoting the search result from `CF1F` into `prv_len` / `prv_pos`. This enables immediate emission of a match at position 0 when applicable, rather than unconditionally forcing a literal byte.
+
+#### 4.4.2 Physical Stream Continuity vs 16-bit Segment Wraparound
+
+In DOS real-mode, input data is read into a 32 KB / 64 KB sliding memory window refilled via `call 0xd234`. Although the 16-bit pointer register `bp` wraps modulo 65,536, the input stream itself is refilled sequentially:
+- The byte `byte2` passed to `lz12_hash_step` is always the next sequential byte from the physical file (`ins_pos`), not a wrapped address within the first 64 KB of memory.
+- A naive 16-bit `uint16_t` address calculation for hash lookahead would erroneously wrap back to offset 0 after 64 KB; the true DOS implementation advances through the physical stream without 64 KB wraparound.
 
 ---
 
